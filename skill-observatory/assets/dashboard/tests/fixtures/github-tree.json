@@ -1,0 +1,10 @@
+{
+  "sha": "tree-sha",
+  "truncated": false,
+  "tree": [
+    { "path": "README.md", "mode": "100644", "type": "blob", "sha": "readme", "size": 100 },
+    { "path": "skills/news-skill/SKILL.md", "mode": "100644", "type": "blob", "sha": "skill", "size": 180 },
+    { "path": "skills/news-skill/examples/SKILL.md", "mode": "100644", "type": "blob", "sha": "nested", "size": 180 },
+    { "path": "assets/large/SKILL.md", "mode": "100644", "type": "blob", "sha": "large", "size": 262145 }
+  ]
+}

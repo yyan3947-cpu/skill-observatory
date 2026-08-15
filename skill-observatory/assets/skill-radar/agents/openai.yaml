@@ -1,0 +1,4 @@
+interface:
+  display_name: "Skill Radar"
+  short_description: "在每项任务开始时匹配并提醒最多三个高相关已安装 Skill"
+  default_prompt: "Use $skill-radar to check this task and remind me of only high-relevance installed Skills."

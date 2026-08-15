@@ -1,0 +1,4 @@
+interface:
+  display_name: "Skill Observatory"
+  short_description: "管理、验证、可视化并智能匹配本机安装的 Codex Skills"
+  default_prompt: "Use $skill-observatory to sync my installed Skills and open the private local dashboard."

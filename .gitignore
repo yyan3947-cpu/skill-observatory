@@ -1,0 +1,41 @@
+# Dependencies
+**/node_modules/
+
+# Private runtime and generated state
+**/.data/
+**/state/
+**/references/catalog.json
+**/catalog.json
+**/history-cache.json
+**/skill-validations.json
+**/github-suggestions-cache.json
+**/setup-complete.json
+
+# Builds and framework caches
+**/dist/
+**/.next/
+**/.vinext/
+**/.wrangler/
+**/out/
+**/coverage/
+
+# Tool caches and logs
+**/.npm-cache/
+**/.pip-cache/
+**/.pydeps/
+**/.cache/
+**/*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Secrets and local configuration
+**/.env*
+**/*.pem
+
+# Editor and operating-system metadata
+.DS_Store
+**/.DS_Store
+**/.idea/
+**/.vscode/
