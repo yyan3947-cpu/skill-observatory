@@ -1,9 +1,14 @@
 import { createHash } from "node:crypto";
 
+import {
+  assertGitHubRepositoryQueryWithinLimit,
+  createGitHubQueryRejectedError,
+} from "./github-query-contract.mjs";
 import { normalizeText, TASK_INTENTS } from "./recommend.mjs";
 
 const MAX_TERMS = 6;
 const MAX_TOTAL_CHARACTERS = 128;
+const REPOSITORY_QUERY_SUFFIX = ' "SKILL.md" in:name,description,readme archived:false';
 
 const CAPABILITY_RULES = Object.freeze([
   {
@@ -13,6 +18,21 @@ const CAPABILITY_RULES = Object.freeze([
   {
     patterns: ["airtable"],
     terms: ["airtable", "data management", "skill"],
+  },
+  {
+    patterns: [
+      "检测数据",
+      "校验数据",
+      "验证数据",
+      "数据检测",
+      "数据校验",
+      "数据验证",
+      "validate data",
+      "data validation",
+      "test data",
+      "data testing",
+    ],
+    terms: ["data validation", "testing", "skill"],
   },
   {
     patterns: [
@@ -59,6 +79,10 @@ const CAPABILITY_RULES = Object.freeze([
 // Never derive a term from the remaining task text: it can contain customer,
 // company, project, or other private names that must stay on the machine.
 const ACTION_RULES = Object.freeze([
+  {
+    patterns: ["检测", "校验", "验证", "测试", "validate", "verify", "test", "check"],
+    terms: ["validation", "testing"],
+  },
   {
     patterns: ["生成", "创建", "制作", "generate", "create", "make"],
     terms: ["generator"],
@@ -217,14 +241,25 @@ function quoteRepositoryTerm(term) {
   return term.includes(" ") ? `"${term}"` : term;
 }
 
-export function buildGitHubRepositoryQueries(values) {
-  const terms = boundTerms(values);
-  if (!terms.length) return [];
-  const capabilities = terms.map(quoteRepositoryTerm).join(" ");
-  const q = `${capabilities} "SKILL.md" in:name,description,readme archived:false`;
-
+function repositorySearches(q) {
   return [
     { mode: "best-match", q, sort: undefined, order: undefined },
     { mode: "stars", q, sort: "stars", order: "desc" },
   ];
+}
+
+export function buildGitHubRepositoryQueries(values) {
+  const terms = boundTerms(values);
+  if (!terms.length) return [];
+  const capabilities = terms.map(quoteRepositoryTerm).join(" ");
+  const q = `${capabilities}${REPOSITORY_QUERY_SUFFIX}`;
+
+  return repositorySearches(q);
+}
+
+export function buildOriginalGitHubRepositoryQueries(query) {
+  const original = typeof query === "string" ? query.trim() : "";
+  if (!original) throw createGitHubQueryRejectedError();
+  const q = assertGitHubRepositoryQueryWithinLimit(`${original}${REPOSITORY_QUERY_SUFFIX}`);
+  return repositorySearches(q);
 }

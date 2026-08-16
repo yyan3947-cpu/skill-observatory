@@ -81,16 +81,23 @@ export interface GitHubSkillSuggestion {
   license: string | null;
 }
 
+export interface RawSearchConsent {
+  token: string;
+  expiresAt: string;
+}
+
 export interface TaskRecommendationResponse {
   results: Recommendation[];
   githubSearch: GitHubSearchPreview | null;
+  rawConsent: RawSearchConsent | null;
 }
 
 export interface GitHubSuggestionResponse {
-  preview: GitHubSearchPreview;
+  preview: GitHubSearchPreview | null;
   results: GitHubSkillSuggestion[];
   cached: boolean;
   incomplete: boolean;
+  rawConsent: RawSearchConsent | null;
   rateLimit: { remaining: number | null; reset: number | null; retryAt: string | null } | null;
 }
 

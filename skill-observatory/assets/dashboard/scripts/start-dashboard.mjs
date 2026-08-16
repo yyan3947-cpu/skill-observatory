@@ -8,7 +8,10 @@ import { readCatalog, syncCatalog } from "../lib/catalog.mjs";
 import { DEFAULT_API_HOST, DEFAULT_API_PORT } from "../lib/contracts.mjs";
 import { createLocalApi } from "../lib/local-api.mjs";
 import { buildGitHubSearchPreview } from "../lib/github-query.mjs";
-import { findGitHubSkillSuggestions } from "../lib/github-suggestions.mjs";
+import {
+  findGitHubSkillSuggestions,
+  findGitHubSkillSuggestionsFromOriginalQuery,
+} from "../lib/github-suggestions.mjs";
 import { recommendSkills } from "../lib/recommend.mjs";
 import { resolveRuntimePaths } from "../lib/runtime-paths.mjs";
 
@@ -80,6 +83,10 @@ async function main() {
     findGitHubSuggestions: ({ query }) => findGitHubSkillSuggestions({
       query,
       cachePath: runtimePaths.githubCachePath,
+      token: process.env.GITHUB_TOKEN?.trim() || undefined,
+    }),
+    findOriginalGitHubSuggestions: ({ query }) => findGitHubSkillSuggestionsFromOriginalQuery({
+      query,
       token: process.env.GITHUB_TOKEN?.trim() || undefined,
     }),
   });

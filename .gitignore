@@ -18,6 +18,7 @@
 **/.wrangler/
 **/out/
 **/coverage/
+*.tsbuildinfo
 
 # Tool caches and logs
 **/.npm-cache/

@@ -1,3 +1,8 @@
+import {
+  assertGitHubRepositoryQueryWithinLimit,
+  createGitHubQueryRejectedError,
+} from "./github-query-contract.mjs";
+
 const API_ORIGIN = "https://api.github.com";
 const DEFAULT_API_VERSION = "2022-11-28";
 const DEFAULT_MAX_CONTENT_BYTES = 256 * 1024;
@@ -33,7 +38,12 @@ function readRateLimit(headers) {
 
 function githubError(code, message, { status, rateLimit } = {}) {
   const error = new Error(message);
-  error.code = code;
+  Object.defineProperty(error, "code", {
+    value: code,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+  });
   if (status !== undefined) error.status = status;
   if (rateLimit) {
     error.rateLimit = rateLimit;
@@ -185,9 +195,10 @@ export function createGitHubClient({
 
   async function searchRepositories({ q, sort, order, perPage = 10 } = {}) {
     const query = String(q ?? "").trim();
-    if (!query || query.length > 256) {
+    if (!query) {
       throw githubError("invalid-github-request", "invalid-github-request");
     }
+    assertGitHubRepositoryQueryWithinLimit(query);
     if (sort !== undefined && sort !== "stars") {
       throw githubError("invalid-github-request", "invalid-github-request");
     }
@@ -200,7 +211,16 @@ export function createGitHubClient({
     url.searchParams.set("per_page", String(normalizePerPage(perPage)));
     if (sort) url.searchParams.set("sort", sort);
     if (order) url.searchParams.set("order", order);
-    const { data, rateLimit } = await requestJson(url);
+    let response;
+    try {
+      response = await requestJson(url);
+    } catch (error) {
+      if (error?.code === "github-request-failed" && error.status === 422) {
+        throw createGitHubQueryRejectedError({ rateLimit: error.rateLimit });
+      }
+      throw error;
+    }
+    const { data, rateLimit } = response;
     if (!data || typeof data !== "object" || !Array.isArray(data.items)) {
       throw githubError("github-request-failed", "github-request-failed", { status: 200, rateLimit });
     }

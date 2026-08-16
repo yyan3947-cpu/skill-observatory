@@ -4,7 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { findGitHubSkillSuggestions } from "../lib/github-suggestions.mjs";
+import {
+  findGitHubSkillSuggestions,
+  findGitHubSkillSuggestionsFromOriginalQuery,
+} from "../lib/github-suggestions.mjs";
 
 const fixturesDirectory = join(import.meta.dirname, "fixtures");
 
@@ -159,6 +162,293 @@ test("validates candidates, removes duplicates, and orders qualified Skills by r
   assert.deepEqual(result.preview.terms, ["current affairs", "news", "research"]);
 });
 
+test("searches the exact original task through the validated pipeline without cache I/O", async () => {
+  const root = await mkdtemp(join(tmpdir(), "skill-observatory-original-search-"));
+  const cachePath = join(root, "must-remain-unchanged.json");
+  await writeFile(cachePath, "cache-sentinel\n", "utf8");
+  const router = await createRouter();
+  const query = "Research current affairs";
+  const result = await findGitHubSkillSuggestionsFromOriginalQuery({
+    query,
+    fetchImpl: router.fetchImpl,
+    token: "test-token",
+  });
+
+  const searchCalls = router.calls.filter((url) => new URL(url).pathname === "/search/repositories");
+  const expectedRepositoryQuery = `${query} "SKILL.md" in:name,description,readme archived:false`;
+  assert.equal(searchCalls.length, 2);
+  assert.ok(searchCalls.every((url) => new URL(url).searchParams.get("q") === expectedRepositoryQuery));
+  assert.equal(result.preview, null);
+  assert.equal(result.cached, false);
+  assert.deepEqual(result.results.map((item) => item.repository), ["owner/news-skill", "owner/research-skill"]);
+  assert.deepEqual(result.results.map((item) => item.stars), [900, 100]);
+  assert.equal(await readFile(cachePath, "utf8"), "cache-sentinel\n");
+});
+
+test("rejects an original-search cache path without reading it or invoking the network", async () => {
+  const root = await mkdtemp(join(tmpdir(), "skill-observatory-original-cache-reject-"));
+  const cachePath = join(root, "must-remain-unchanged.json");
+  await writeFile(cachePath, "cache-sentinel\n", "utf8");
+  let calls = 0;
+  await assert.rejects(
+    () => findGitHubSkillSuggestionsFromOriginalQuery({
+      query: "Research current affairs",
+      cachePath,
+      fetchImpl: async () => { calls += 1; },
+    }),
+    (error) => error.code === "original-search-cache-not-allowed" &&
+      error.message === "original-search-cache-not-allowed" &&
+      !error.message.includes(cachePath),
+  );
+  assert.equal(calls, 0);
+  assert.equal(await readFile(cachePath, "utf8"), "cache-sentinel\n");
+});
+
+test("rejects a cachePath accessor without invoking the getter", async () => {
+  let getterCalls = 0;
+  let networkCalls = 0;
+  const options = {
+    query: "Research current affairs",
+    fetchImpl: async () => { networkCalls += 1; },
+  };
+  Object.defineProperty(options, "cachePath", {
+    get() {
+      getterCalls += 1;
+      throw new Error("cache-getter-secret");
+    },
+  });
+
+  await assert.rejects(
+    () => findGitHubSkillSuggestionsFromOriginalQuery(options),
+    (error) => error.code === "original-search-cache-not-allowed" &&
+      !String(error.stack).includes("cache-getter-secret"),
+  );
+  assert.equal(getterCalls, 0);
+  assert.equal(networkCalls, 0);
+});
+
+test("defines original-search error codes without inherited getters or setters", async () => {
+  const previousCodeDescriptor = Object.getOwnPropertyDescriptor(Object.prototype, "code");
+  let getterCalls = 0;
+  let setterCalls = 0;
+  let networkCalls = 0;
+  let caught;
+  Object.defineProperty(Object.prototype, "code", {
+    configurable: true,
+    get() {
+      getterCalls += 1;
+      return "polluted-error-code";
+    },
+    set() {
+      setterCalls += 1;
+    },
+  });
+  try {
+    await findGitHubSkillSuggestionsFromOriginalQuery({
+      query: "Research current affairs",
+      cachePath: "/tmp/original-search-cache-secret.json",
+      fetchImpl: async () => { networkCalls += 1; },
+    });
+  } catch (error) {
+    caught = error;
+  } finally {
+    if (previousCodeDescriptor) {
+      Object.defineProperty(Object.prototype, "code", previousCodeDescriptor);
+    } else {
+      delete Object.prototype.code;
+    }
+  }
+  assert.equal(getterCalls, 0);
+  assert.equal(setterCalls, 0);
+  assert.equal(networkCalls, 0);
+  assert.equal(Object.hasOwn(caught, "code"), true);
+  assert.equal(caught.code, "original-search-cache-not-allowed");
+});
+
+test("rejects non-plain original-search options and accessors before reading values", async () => {
+  let networkCalls = 0;
+  const inherited = Object.create({ cachePath: "/tmp/inherited-cache-must-not-be-used.json" });
+  inherited.query = "Research current affairs";
+  inherited.fetchImpl = async () => { networkCalls += 1; };
+  await assert.rejects(
+    () => findGitHubSkillSuggestionsFromOriginalQuery(inherited),
+    (error) => error.code === "invalid-original-search-options" &&
+      !error.message.includes("inherited-cache-must-not-be-used"),
+  );
+
+  let getterCalls = 0;
+  const accessor = {};
+  Object.defineProperty(accessor, "query", {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      throw new Error("query-getter-secret");
+    },
+  });
+  await assert.rejects(
+    () => findGitHubSkillSuggestionsFromOriginalQuery(accessor),
+    (error) => error.code === "invalid-original-search-options" &&
+      !String(error.stack).includes("query-getter-secret"),
+  );
+  assert.equal(getterCalls, 0);
+  assert.equal(networkCalls, 0);
+});
+
+test("rejects time-varying Proxies before any reflective trap or network call", async () => {
+  let trapCalls = 0;
+  let networkCalls = 0;
+  const target = {
+    query: "Research current affairs",
+    fetchImpl: async () => {
+      networkCalls += 1;
+      return new Response("remote-body-secret", { status: 422 });
+    },
+  };
+  const options = new Proxy(target, {
+    getPrototypeOf(value) {
+      trapCalls += 1;
+      return trapCalls % 2 === 0 ? null : Reflect.getPrototypeOf(value);
+    },
+    ownKeys(value) {
+      trapCalls += 1;
+      return trapCalls % 2 === 0 ? Reflect.ownKeys(value) : Reflect.ownKeys(value).reverse();
+    },
+    getOwnPropertyDescriptor(value, key) {
+      trapCalls += 1;
+      return Reflect.getOwnPropertyDescriptor(value, key);
+    },
+    get(value, key, receiver) {
+      trapCalls += 1;
+      return Reflect.get(value, key, receiver);
+    },
+  });
+
+  await assert.rejects(
+    () => findGitHubSkillSuggestionsFromOriginalQuery(options),
+    (error) => error.code === "invalid-original-search-options" &&
+      error.message === "invalid-original-search-options",
+  );
+  assert.equal(trapCalls, 0);
+  assert.equal(networkCalls, 0);
+});
+
+test("accepts null-prototype original-search options", async () => {
+  const router = await createRouter();
+  const options = Object.create(null);
+  Object.defineProperties(options, {
+    query: { value: "Research current affairs", enumerable: true },
+    fetchImpl: { value: router.fetchImpl, enumerable: true },
+    token: { value: "test-token", enumerable: true },
+  });
+
+  const result = await findGitHubSkillSuggestionsFromOriginalQuery(options);
+  assert.deepEqual(result.results.map((item) => item.repository), ["owner/news-skill", "owner/research-skill"]);
+  assert.deepEqual(result.results.map((item) => item.stars), [900, 100]);
+});
+
+test("ignores Object.prototype accessors while reading original-search options", async () => {
+  const previousQueryDescriptor = Object.getOwnPropertyDescriptor(Object.prototype, "query");
+  let getterCalls = 0;
+  let networkCalls = 0;
+  Object.defineProperty(Object.prototype, "query", {
+    configurable: true,
+    get() {
+      getterCalls += 1;
+      return { value: "Research current affairs" };
+    },
+  });
+  try {
+    await assert.rejects(
+      () => findGitHubSkillSuggestionsFromOriginalQuery({
+        fetchImpl: async () => {
+          networkCalls += 1;
+          return new Response("remote-body-secret", { status: 422 });
+        },
+      }),
+      (error) => error.code === "github-query-rejected" &&
+        error.message === "github-query-rejected" &&
+        !String(error.stack).includes("Research current affairs"),
+    );
+  } finally {
+    if (previousQueryDescriptor) {
+      Object.defineProperty(Object.prototype, "query", previousQueryDescriptor);
+    } else {
+      delete Object.prototype.query;
+    }
+  }
+  assert.equal(getterCalls, 0);
+  assert.equal(networkCalls, 0);
+});
+
+test("does not truncate a rejected original task", async () => {
+  let calls = 0;
+  await assert.rejects(
+    () => findGitHubSkillSuggestionsFromOriginalQuery({
+      query: "x".repeat(256),
+      fetchImpl: async () => { calls += 1; },
+    }),
+    (error) => error.code === "github-query-rejected" && !error.message.includes("x".repeat(32)),
+  );
+  assert.equal(calls, 0);
+});
+
+for (const mode of ["sanitized", "original"]) {
+  test(`stops after the first rejected ${mode} repository search without caching`, async () => {
+    const root = await mkdtemp(join(tmpdir(), `skill-observatory-query-rejected-${mode}-`));
+    const cachePath = join(root, "state", "github-suggestions-cache.json");
+    const calls = [];
+    const fetchImpl = async (url) => {
+      calls.push(url);
+      return new Response("remote-body-secret", { status: 422 });
+    };
+    const run = mode === "sanitized"
+      ? () => findGitHubSkillSuggestions({ query: "国际时事", cachePath, fetchImpl })
+      : () => findGitHubSkillSuggestionsFromOriginalQuery({ query: "Research current affairs", fetchImpl });
+
+    await assert.rejects(run, (error) => {
+      assert.equal(error.code, "github-query-rejected");
+      assert.equal(error.message, "github-query-rejected");
+      assert.doesNotMatch(String(error.stack), /remote-body-secret|Research current affairs/u);
+      return true;
+    });
+    assert.equal(calls.length, 1);
+    assert.equal(new URL(calls[0]).pathname, "/search/repositories");
+    if (mode === "sanitized") {
+      await assert.rejects(readFile(cachePath, "utf8"), (error) => error.code === "ENOENT");
+    }
+  });
+}
+
+test("keeps cache functions outside the original-query entry path", async () => {
+  const file = await readFile(new URL("../lib/github-suggestions.mjs", import.meta.url), "utf8");
+  const discoveryStart = file.indexOf("async function discoverGitHubSkillSuggestions");
+  const sanitizedStart = file.indexOf("async function findUncachedGitHubSkillSuggestions", discoveryStart);
+  const optionHelperStart = file.indexOf("function ownDescriptorValue");
+  const normalizationStart = file.indexOf("function normalizeOriginalSearchOptions");
+  const originalStart = file.indexOf("export async function findGitHubSkillSuggestionsFromOriginalQuery");
+  assert.ok(
+    discoveryStart >= 0 &&
+    sanitizedStart > discoveryStart &&
+    optionHelperStart > sanitizedStart &&
+    normalizationStart > optionHelperStart &&
+    originalStart > normalizationStart,
+  );
+  const discoveryCode = file.slice(discoveryStart, sanitizedStart);
+  const normalizationCode = file.slice(optionHelperStart, originalStart);
+  const originalCode = file.slice(originalStart);
+  const cacheFreeCode = `${discoveryCode}\n${normalizationCode}\n${originalCode}`;
+  assert.doesNotMatch(
+    cacheFreeCode,
+    /readPrivateCache|writeCacheEntry|inFlightSuggestions|ensurePrivateDirectory|atomicWriteJson|readJsonFile|withCacheWriteLock/u,
+  );
+  const proxyGuardIndex = normalizationCode.indexOf("types.isProxy(options)");
+  const prototypeIndex = normalizationCode.indexOf("Object.getPrototypeOf(options)");
+  const snapshotIndex = normalizationCode.indexOf("Object.getOwnPropertyDescriptors(options)");
+  assert.ok(proxyGuardIndex >= 0 && proxyGuardIndex < prototypeIndex && proxyGuardIndex < snapshotIndex);
+  assert.equal(normalizationCode.match(/Object\.getOwnPropertyDescriptors\(options\)/gu)?.length, 1);
+  assert.doesNotMatch(normalizationCode, /Object\.hasOwn\(options/u);
+});
+
 test("cache omits the original task, token, and Skill text, then expires after 24 hours", async () => {
   const root = await mkdtemp(join(tmpdir(), "skill-observatory-github-cache-"));
   const cachePath = join(root, "state", "github-suggestions-cache.json");
@@ -273,12 +563,15 @@ test("does not cache when every candidate content request fails without a succes
   await assert.rejects(readFile(cachePath, "utf8"), (error) => error.code === "ENOENT");
 });
 
-test("keeps successful candidates when another repository returns an ordinary 404", async () => {
+test("retries an incomplete discovery, caches only the complete retry, and then serves it", async () => {
   const root = await mkdtemp(join(tmpdir(), "skill-observatory-partial-404-"));
+  const cachePath = join(root, "state", "github-suggestions-cache.json");
   const router = await createRouter();
-  const result = await findGitHubSkillSuggestions({
-    query: "国际时事",
-    cachePath: join(root, "state", "github-suggestions-cache.json"),
+  const query = "原始秘密任务：国际时事";
+  const first = await findGitHubSkillSuggestions({
+    query,
+    cachePath,
+    token: "partial-token-secret",
     fetchImpl: async (url, options) => {
       if (String(url).includes("/repos/owner/invalid-skill/contents/")) {
         return new Response("not-found-secret", { status: 404 });
@@ -286,8 +579,68 @@ test("keeps successful candidates when another repository returns an ordinary 40
       return router.fetchImpl(url, options);
     },
   });
-  assert.equal(result.incomplete, true);
-  assert.deepEqual(result.results.map((item) => item.repository), ["owner/news-skill", "owner/research-skill"]);
+  assert.equal(first.cached, false);
+  assert.equal(first.incomplete, true);
+  assert.deepEqual(first.results.map((item) => item.repository), ["owner/news-skill", "owner/research-skill"]);
+  await assert.rejects(readFile(cachePath, "utf8"), (error) => error.code === "ENOENT");
+
+  const callsBeforeRetry = router.calls.length;
+  const second = await findGitHubSkillSuggestions({
+    query,
+    cachePath,
+    token: "complete-token-secret",
+    fetchImpl: router.fetchImpl,
+  });
+  assert.equal(second.cached, false);
+  assert.equal(second.incomplete, false);
+  assert.deepEqual(second.results.map((item) => item.repository), ["owner/news-skill", "owner/research-skill"]);
+  assert.equal(router.calls.length > callsBeforeRetry, true);
+  const completeCacheText = await readFile(cachePath, "utf8");
+  assert.doesNotMatch(completeCacheText, /原始秘密任务|partial-token-secret|complete-token-secret|not-found-secret/u);
+
+  let thirdNetworkCalls = 0;
+  const third = await findGitHubSkillSuggestions({
+    query,
+    cachePath,
+    fetchImpl: async () => {
+      thirdNetworkCalls += 1;
+      throw new Error("complete-cache-miss");
+    },
+  });
+  assert.equal(third.cached, true);
+  assert.equal(third.incomplete, false);
+  assert.equal(thirdNetworkCalls, 0);
+});
+
+test("treats a legacy incomplete cache entry as a miss and replaces it with a complete result", async () => {
+  const root = await mkdtemp(join(tmpdir(), "skill-observatory-legacy-incomplete-cache-"));
+  const cachePath = join(root, "state", "github-suggestions-cache.json");
+  const now = new Date("2026-08-15T00:00:00Z");
+  const initialRouter = await createRouter();
+  await findGitHubSkillSuggestions({
+    query: "国际时事",
+    cachePath,
+    fetchImpl: initialRouter.fetchImpl,
+    now,
+  });
+  const legacyCache = JSON.parse(await readFile(cachePath, "utf8"));
+  const [cacheKey] = Object.keys(legacyCache.entries);
+  legacyCache.entries[cacheKey].incomplete = true;
+  await writeFile(cachePath, `${JSON.stringify(legacyCache)}\n`, { encoding: "utf8", mode: 0o600 });
+  await chmod(cachePath, 0o600);
+
+  const retryRouter = await createRouter();
+  const retried = await findGitHubSkillSuggestions({
+    query: "国际时事",
+    cachePath,
+    fetchImpl: retryRouter.fetchImpl,
+    now: new Date(now.getTime() + 60_000),
+  });
+  assert.equal(retried.cached, false);
+  assert.equal(retried.incomplete, false);
+  assert.equal(retryRouter.calls.length > 0, true);
+  const rewrittenCache = JSON.parse(await readFile(cachePath, "utf8"));
+  assert.equal(rewrittenCache.entries[cacheKey].incomplete, false);
 });
 
 test("strictly rejects unsafe or malformed YAML frontmatter", async () => {

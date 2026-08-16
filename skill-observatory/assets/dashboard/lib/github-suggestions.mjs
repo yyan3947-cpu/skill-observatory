@@ -1,12 +1,17 @@
 import { createHash } from "node:crypto";
 import { lstat } from "node:fs/promises";
 import { dirname, isAbsolute, posix } from "node:path";
+import { types } from "node:util";
 
 import yaml from "js-yaml";
 
 import { atomicWriteJson, readJsonFile } from "./cache.mjs";
 import { createGitHubClient } from "./github-client.mjs";
-import { buildGitHubRepositoryQueries, buildGitHubSearchPreview } from "./github-query.mjs";
+import {
+  buildGitHubRepositoryQueries,
+  buildGitHubSearchPreview,
+  buildOriginalGitHubRepositoryQueries,
+} from "./github-query.mjs";
 import { normalizeText, recommendSkills } from "./recommend.mjs";
 import { ensurePrivateDirectory } from "./runtime-paths.mjs";
 
@@ -408,7 +413,7 @@ function sanitizeCacheEntry(entry, cacheKey, nowMilliseconds) {
     !Number.isFinite(expiresAt) ||
     expiresAt <= nowMilliseconds ||
     expiresAt > nowMilliseconds + CACHE_TTL_MILLISECONDS ||
-    typeof entry.incomplete !== "boolean"
+    entry.incomplete !== false
   ) return null;
   const terms = normalizeCachedTerms(entry.preview.terms);
   if (!terms || cacheKeyForTerms(terms) !== cacheKey) return null;
@@ -472,6 +477,7 @@ function sanitizedCacheForWrite(cache, nowMilliseconds) {
 }
 
 async function writeCacheEntry({ cachePath, preview, results, incomplete, rateLimit, nowMilliseconds }) {
+  if (incomplete) return;
   await withCacheWriteLock(cachePath, async () => {
     const currentCache = await readPrivateCache(cachePath);
     const normalizedCache = sanitizedCacheForWrite(currentCache, nowMilliseconds);
@@ -486,31 +492,35 @@ async function writeCacheEntry({ cachePath, preview, results, incomplete, rateLi
   });
 }
 
-function isFatalRequestError(error) {
-  return ["github-rate-limited", "github-request-timeout"].includes(error?.code);
+function codedError(code) {
+  const error = new Error(code);
+  Object.defineProperty(error, "code", {
+    value: code,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+  });
+  return error;
 }
 
-async function findUncachedGitHubSkillSuggestions({
+function isFatalRequestError(error) {
+  return ["github-query-rejected", "github-rate-limited", "github-request-timeout"].includes(error?.code);
+}
+
+async function discoverGitHubSkillSuggestions({
+  repositoryQueries,
+  matchText,
   preview,
-  cachePath,
   fetchImpl = globalThis.fetch,
   token = "",
-  now = Date.now(),
   requestTimeoutMilliseconds,
 } = {}) {
-  const nowMilliseconds = resolveNow(now);
-  await ensurePrivateDirectory(dirname(cachePath));
-  const cache = await readPrivateCache(cachePath);
-  const cached = readFreshCacheEntry(cache, preview, nowMilliseconds);
-  if (cached) return cached;
-
   const client = createGitHubClient({
     fetchImpl,
     token,
     requestTimeoutMilliseconds,
     requestScheduler: withNetworkPermit,
   });
-  const repositoryQueries = buildGitHubRepositoryQueries(preview.terms);
   const searches = [];
   let incomplete = false;
   let rateLimit = null;
@@ -588,25 +598,20 @@ async function findUncachedGitHubSkillSuggestions({
 
   if (validation.fatalError) throw validation.fatalError;
   if (repositories.length && validation.treeSuccesses === 0) {
-    throw validation.firstTreeError ?? Object.assign(new Error("github-request-failed"), {
-      code: "github-request-failed",
-    });
+    throw validation.firstTreeError ?? codedError("github-request-failed");
   }
   if (validation.contentPaths > 0 && validation.contentSuccesses === 0) {
-    throw validation.firstContentError ?? Object.assign(new Error("github-request-failed"), {
-      code: "github-request-failed",
-    });
+    throw validation.firstContentError ?? codedError("github-request-failed");
   }
 
   const candidates = repositoryCandidates.flat();
-  const queryText = preview.terms.join(" ");
   const matched = [];
   const seenPaths = new Set();
   for (const candidate of candidates) {
     const key = `${candidate.repository}\0${candidate.path}`;
     if (seenPaths.has(key)) continue;
     seenPaths.add(key);
-    const [match] = recommendSkills(queryText, { skills: [candidate.catalogRecord] }, {
+    const [match] = recommendSkills(matchText, { skills: [candidate.catalogRecord] }, {
       limit: 36,
       minimumScore: 12,
     });
@@ -621,9 +626,33 @@ async function findUncachedGitHubSkillSuggestions({
     a.skillDirectory.localeCompare(b.skillDirectory)
   ));
   const results = matched.slice(0, 3).map((candidate) => publicResult(candidate, candidate.match));
-  const response = { preview, results, cached: false, incomplete, rateLimit };
+  return { preview, results, cached: false, incomplete, rateLimit };
+}
 
-  await writeCacheEntry({ cachePath, preview, results, incomplete, rateLimit, nowMilliseconds });
+async function findUncachedGitHubSkillSuggestions(options) {
+  const nowMilliseconds = resolveNow(options.now);
+  await ensurePrivateDirectory(dirname(options.cachePath));
+  const cache = await readPrivateCache(options.cachePath);
+  const cached = readFreshCacheEntry(cache, options.preview, nowMilliseconds);
+  if (cached) return cached;
+
+  const response = await discoverGitHubSkillSuggestions({
+    repositoryQueries: buildGitHubRepositoryQueries(options.preview.terms),
+    matchText: options.preview.terms.join(" "),
+    preview: options.preview,
+    fetchImpl: options.fetchImpl,
+    token: options.token,
+    requestTimeoutMilliseconds: options.requestTimeoutMilliseconds,
+  });
+
+  await writeCacheEntry({
+    cachePath: options.cachePath,
+    preview: options.preview,
+    results: response.results,
+    incomplete: response.incomplete,
+    rateLimit: response.rateLimit,
+    nowMilliseconds,
+  });
   return response;
 }
 
@@ -658,4 +687,51 @@ export async function findGitHubSkillSuggestions({
   } finally {
     if (inFlightSuggestions.get(inFlightKey) === pending) inFlightSuggestions.delete(inFlightKey);
   }
+}
+
+function ownDescriptorValue(descriptors, key) {
+  return Object.hasOwn(descriptors, key) ? descriptors[key].value : undefined;
+}
+
+function normalizeOriginalSearchOptions(options) {
+  if (types.isProxy(options)) throw codedError("invalid-original-search-options");
+  if (!options || typeof options !== "object" || Array.isArray(options)) {
+    throw codedError("invalid-original-search-options");
+  }
+  const prototype = Object.getPrototypeOf(options);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw codedError("invalid-original-search-options");
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(options);
+  if (Object.hasOwn(descriptors, "cachePath")) {
+    throw codedError("original-search-cache-not-allowed");
+  }
+  if (Reflect.ownKeys(descriptors).some((key) => !Object.hasOwn(descriptors[key], "value"))) {
+    throw codedError("invalid-original-search-options");
+  }
+  return {
+    query: ownDescriptorValue(descriptors, "query"),
+    fetchImpl: ownDescriptorValue(descriptors, "fetchImpl"),
+    token: ownDescriptorValue(descriptors, "token"),
+    requestTimeoutMilliseconds: ownDescriptorValue(descriptors, "requestTimeoutMilliseconds"),
+  };
+}
+
+export async function findGitHubSkillSuggestionsFromOriginalQuery(options = {}) {
+  const {
+    query,
+    fetchImpl = globalThis.fetch,
+    token = "",
+    requestTimeoutMilliseconds,
+  } = normalizeOriginalSearchOptions(options);
+  const canonical = typeof query === "string" ? query.trim() : "";
+  const repositoryQueries = buildOriginalGitHubRepositoryQueries(canonical);
+  return discoverGitHubSkillSuggestions({
+    repositoryQueries,
+    matchText: canonical,
+    preview: null,
+    fetchImpl,
+    token,
+    requestTimeoutMilliseconds,
+  });
 }

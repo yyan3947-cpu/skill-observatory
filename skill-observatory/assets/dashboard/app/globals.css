@@ -145,19 +145,75 @@ h1 { margin-bottom: 8px; font-size: clamp(42px, 7vw, 78px); font-weight: 640; le
 .github-search-action strong { font-size: 13px; }
 .github-search-action p { margin: 5px 0 0; color: var(--muted); font-size: 12px; }
 .github-search-action code { color: var(--accent); font-family: var(--font-geist-mono), monospace; }
-.github-search-button {
-  min-width: 128px;
+.github-disclosure { margin-top: 7px !important; }
+.github-recovery { margin-top: 10px; }
+.github-recovery button,
+.raw-consent-actions button,
+.raw-revoke-actions button {
   min-height: 44px;
   padding: 0 14px;
-  border: 1px solid var(--accent);
   border-radius: 9px;
-  background: rgb(143 227 193 / 10%);
-  color: var(--accent);
   cursor: pointer;
   font-size: 12px;
   font-weight: 700;
 }
-.github-search-button:disabled { cursor: wait; opacity: .55; }
+.github-recovery button {
+  margin-top: 10px;
+  border: 1px solid var(--warn);
+  background: rgb(243 201 105 / 8%);
+  color: var(--warn);
+}
+.raw-consent {
+  margin-top: 12px;
+  padding: 16px;
+  border: 1px solid rgb(243 201 105 / 45%);
+  border-radius: 10px;
+  background: rgb(243 201 105 / 6%);
+}
+.raw-consent h3 { margin-bottom: 10px; font-size: 14px; }
+.matcher .raw-consent > p { margin-top: 10px; font-size: 12px; }
+.matcher .raw-consent .consent-expiry { color: var(--warn); }
+.raw-consent-intro { margin-top: 12px !important; }
+.raw-query {
+  width: 100%;
+  max-height: 220px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #090d13;
+  color: var(--text);
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 12px;
+  line-height: 1.65;
+  resize: vertical;
+}
+.raw-consent-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+.raw-consent-actions button { min-height: 44px; }
+.raw-revoke-status {
+  margin-top: 12px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel-strong);
+}
+.raw-revoke-status > p { margin: 0; color: var(--muted); font-size: 12px; }
+.raw-revoke-actions { display: flex; gap: 10px; margin-top: 10px; }
+.raw-revoke-actions button {
+  min-height: 44px;
+  border: 1px solid var(--line);
+  background: var(--panel-strong);
+  color: var(--text);
+}
+.raw-confirm-button { border: 1px solid var(--accent); background: var(--accent); color: #0a1a14; }
+.raw-cancel-button { border: 1px solid var(--line); background: var(--panel-strong); color: var(--text); }
+.raw-consent-actions button:disabled,
+.raw-revoke-actions button:disabled,
+.github-recovery button:disabled { cursor: wait; opacity: .55; }
 .github-results { min-height: 20px; margin-top: 10px; }
 .github-status, .incomplete-note { margin: 0; color: var(--muted); font-size: 12px; }
 .matcher .incomplete-note { margin-top: 10px; color: var(--warn); }
@@ -273,7 +329,7 @@ h1 { margin-bottom: 8px; font-size: clamp(42px, 7vw, 78px); font-weight: 640; le
 footer { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; margin-top: 24px; padding: 19px 2px; color: var(--muted); font-size: 12px; line-height: 1.55; }
 footer p { margin: 0; }
 footer code { color: var(--accent); font-family: var(--font-geist-mono), monospace; }
-button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible, a:focus-visible, .raw-query:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 @media (max-width: 760px) {
   .shell { width: min(100% - 24px, 620px); padding-top: 32px; }
   .topbar { align-items: flex-start; flex-direction: column; }
@@ -282,7 +338,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
   .matcher { grid-template-columns: 1fr; gap: 26px; }
   .input-row { flex-direction: column; }
   .github-search-action, .github-result-heading { align-items: stretch; flex-direction: column; }
-  .github-search-button { width: 100%; }
+  .raw-consent-actions { flex-direction: column; }
+  .raw-consent-actions button { width: 100%; }
   .github-metadata { grid-template-columns: 1fr; }
   .select-grid { grid-template-columns: 1fr 1fr; }
   .skill-row > summary { grid-template-columns: 28px 1fr 22px; padding: 16px 0; }

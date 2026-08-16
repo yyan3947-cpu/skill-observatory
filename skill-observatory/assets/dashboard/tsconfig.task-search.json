@@ -1,0 +1,14 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "incremental": false
+  },
+  "include": [
+    "next-env.d.ts",
+    "app/lib/catalog.ts",
+    "app/lib/api.ts",
+    "app/lib/task-search-controller.ts",
+    "app/components/TaskMatcher.tsx"
+  ],
+  "exclude": ["node_modules"]
+}

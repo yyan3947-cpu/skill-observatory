@@ -1,79 +1,64 @@
-import { useRef, useState, type FormEvent } from "react";
-import { recommendTask, searchGitHubSkills } from "../lib/api";
+import { useEffect, useState, type FormEvent } from "react";
 import {
-  STATUS_LABELS,
-  formatDate,
-  type GitHubSearchPreview,
-  type GitHubSkillSuggestion,
-  type Recommendation,
-} from "../lib/catalog";
+  recommendTask,
+  revokeOriginalSearchConsent,
+  searchOriginalGitHubSkills,
+  searchSanitizedGitHubSkills,
+} from "../lib/api";
+import { STATUS_LABELS, formatDate } from "../lib/catalog";
+import {
+  createTaskSearchController,
+  formatTaskSearchError,
+  isTaskSearchInFlight,
+} from "../lib/task-search-controller";
 
 export function TaskMatcher() {
-  const [query, setQuery] = useState("");
-  const [results, setResults] = useState<Recommendation[] | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
-  const [submittedQuery, setSubmittedQuery] = useState("");
-  const [githubSearch, setGithubSearch] = useState<GitHubSearchPreview | null>(null);
-  const [githubResults, setGithubResults] = useState<GitHubSkillSuggestion[] | null>(null);
-  const [githubLoading, setGithubLoading] = useState(false);
-  const [githubError, setGithubError] = useState("");
-  const [githubIncomplete, setGithubIncomplete] = useState(false);
-  const githubRequestInFlight = useRef(false);
-  const githubRequestVersion = useRef(0);
+  const [controller] = useState(() => createTaskSearchController({
+    recommendTask,
+    searchSanitizedGitHubSkills,
+    searchOriginalGitHubSkills,
+    revokeOriginalSearchConsent,
+  }));
+  const [state, setState] = useState(() => controller.getState());
 
-  async function submit(event: FormEvent) {
+  useEffect(() => {
+    const unsubscribe = controller.subscribe(setState);
+    return () => {
+      unsubscribe();
+      controller.dispose();
+    };
+  }, [controller]);
+
+  function submit(event: FormEvent) {
     event.preventDefault();
-    const taskQuery = query.trim();
-    if (!taskQuery) return;
-    githubRequestVersion.current += 1;
-    githubRequestInFlight.current = false;
-    setLoading(true);
-    setError("");
-    setResults(null);
-    setSubmittedQuery("");
-    setGithubSearch(null);
-    setGithubResults(null);
-    setGithubLoading(false);
-    setGithubError("");
-    setGithubIncomplete(false);
-    try {
-      const response = await recommendTask(taskQuery);
-      setResults(response.results);
-      setGithubSearch(response.githubSearch);
-      setSubmittedQuery(taskQuery);
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "暂时无法完成匹配");
-    } finally {
-      setLoading(false);
-    }
+    void controller.submit();
   }
 
-  async function searchGitHub() {
-    if (githubRequestInFlight.current || !githubSearch || results?.length !== 0 || !submittedQuery) return;
-    githubRequestInFlight.current = true;
-    const requestVersion = githubRequestVersion.current + 1;
-    githubRequestVersion.current = requestVersion;
-    setGithubLoading(true);
-    setGithubResults(null);
-    setGithubError("");
-    setGithubIncomplete(false);
-    try {
-      const response = await searchGitHubSkills(submittedQuery);
-      if (requestVersion !== githubRequestVersion.current) return;
-      setGithubResults(response.results.slice(0, 3));
-      setGithubIncomplete(response.incomplete);
-    } catch (caught) {
-      if (requestVersion !== githubRequestVersion.current) return;
-      const message = caught instanceof Error ? caught.message : "GitHub 查找暂时失败。";
-      setGithubError(`${message} 你可以再次点击“在 GitHub 查找”重试。`);
-    } finally {
-      if (requestVersion === githubRequestVersion.current) {
-        githubRequestInFlight.current = false;
-        setGithubLoading(false);
-      }
-    }
-  }
+  const {
+    query,
+    submittedQuery,
+    results,
+    githubSearch,
+    githubResults,
+    githubIncomplete,
+    rawConsent,
+    phase,
+    originalOutcome,
+    error,
+  } = state;
+  const isSearching = isTaskSearchInFlight(state);
+  const submitBlocked = isSearching || phase === "raw-revoke-error";
+  const errorMessage = formatTaskSearchError(error);
+  const showRawConsent = (phase === "raw-consent" && rawConsent) || phase === "raw-searching";
+  const submitLabel = phase === "local-searching"
+    ? "匹配中…"
+    : phase === "sanitized-searching"
+      ? "脱敏搜索中…"
+      : phase === "raw-searching"
+        ? "原文搜索中…"
+        : phase === "raw-revoking"
+          ? "正在撤销授权…"
+        : "匹配 Skill";
 
   return (
     <section className="matcher panel" aria-labelledby="matcher-title">
@@ -91,15 +76,15 @@ export function TaskMatcher() {
               value={query}
               maxLength={4096}
               placeholder="例如：分析一只 A 股并生成报告"
-              onChange={(event) => setQuery(event.target.value)}
+              onChange={(event) => controller.changeQuery(event.target.value)}
             />
-            <button type="submit" disabled={loading || !query.trim()}>
-              {loading ? "匹配中…" : "匹配 Skill"}
+            <button type="submit" disabled={submitBlocked || !query.trim()} aria-busy={isSearching}>
+              {submitLabel}
             </button>
           </div>
         </form>
         <div className="match-results" aria-live="polite">
-          {error && <p className="inline-error" role="alert">{error}</p>}
+          {error?.stage === "local" && <p className="inline-error" role="alert">{errorMessage}</p>}
           {results?.length === 0 && <p className="empty-inline">本机没有达到推荐阈值的 Skill。</p>}
           {results?.map((result, index) => (
             <article className="match-result" key={result.skillId}>
@@ -111,56 +96,140 @@ export function TaskMatcher() {
               <span className={`status ${result.status}`}>{STATUS_LABELS[result.status]}</span>
             </article>
           ))}
+
           {results?.length === 0 && githubSearch && (
             <div className="github-search-action">
               <div>
-                <strong>从 GitHub 补充查找</strong>
-                <p>将发送到 GitHub：<code>{githubSearch.label}</code></p>
+                {phase === "sanitized-searching" ? (
+                  <p className="github-status" role="status">
+                    正在用脱敏能力词自动搜索 GitHub：<code>{githubSearch.label}</code>
+                  </p>
+                ) : (
+                  <p>脱敏搜索使用的能力词：<code>{githubSearch.label}</code></p>
+                )}
+                <p className="github-disclosure">只发送任务能力词，不发送未识别的名称或项目内容。</p>
               </div>
-              <button
-                className="github-search-button"
-                type="button"
-                onClick={searchGitHub}
-                disabled={githubLoading}
-                aria-busy={githubLoading}
-              >
-                {githubLoading ? "查找并验证中…" : "在 GitHub 查找"}
+            </div>
+          )}
+
+          {results?.length === 0 && phase === "sanitized-error" && (
+            <div className="github-recovery">
+              {githubIncomplete && (
+                <p className="incomplete-note">GitHub 返回的结果不完整，未启用原文搜索。</p>
+              )}
+              {error?.stage === "sanitized" && <p className="inline-error" role="alert">{errorMessage}</p>}
+              <button type="button" onClick={() => void controller.retrySanitizedSearch()} disabled={isSearching}>
+                重试脱敏搜索
               </button>
             </div>
           )}
-          {results?.length === 0 && githubSearch && (
-            <div className="github-results" aria-live="polite" aria-busy={githubLoading}>
-              {githubLoading && <p className="github-status" role="status">正在 GitHub 查找并验证 Skill…</p>}
-              {githubError && <p className="inline-error" role="alert">{githubError}</p>}
-              {githubResults?.length === 0 && (
-                <p className="empty-inline">GitHub 上没有找到经过验证的相关 Skill。</p>
+
+          {showRawConsent && (
+            <>
+              {githubSearch ? (
+                <p className="empty-inline raw-consent-intro">
+                  GitHub 上没有找到经过验证的相关 Skill。你可以选择发送下面的原始任务，再搜索一次。
+                </p>
+              ) : (
+                <p className="incomplete-note raw-consent-intro">
+                  无法生成安全能力词，尚未向 GitHub 发送脱敏查询。
+                </p>
               )}
-              {githubIncomplete && <p className="incomplete-note">GitHub 返回的结果可能不完整。</p>}
-              {githubResults?.map((result) => (
-                <article className="github-result" key={`${result.repository}/${result.skillDirectory}`}>
-                  <div className="github-result-heading">
-                    <div>
-                      <strong>{result.name}</strong>
-                      <p>{result.summary}</p>
-                    </div>
-                    <span className="repo-stars" aria-label={`仓库 Star ${result.stars.toLocaleString()}`}>
-                      ★ {result.stars.toLocaleString()}
-                    </span>
-                  </div>
-                  <p className="github-reason">{result.reasonZh}</p>
-                  <dl className="github-metadata">
-                    <div><dt>仓库</dt><dd>{result.repository}</dd></div>
-                    <div><dt>Skill 目录</dt><dd>{result.skillDirectory}</dd></div>
-                    <div><dt>更新时间</dt><dd>{result.pushedAt ? formatDate(result.pushedAt) : "未知"}</dd></div>
-                    <div><dt>许可证</dt><dd>{result.license?.trim() || "未标注"}</dd></div>
-                  </dl>
-                  <a className="external-link" href={result.repositoryUrl} target="_blank" rel="noreferrer">
-                    查看 GitHub
-                  </a>
-                </article>
-              ))}
-            </div>
+              <section className="raw-consent" aria-labelledby="raw-consent-title">
+                <h3 id="raw-consent-title">即将发送到 GitHub 搜索的完整内容</h3>
+                <textarea
+                  className="raw-query"
+                  value={submittedQuery}
+                  rows={6}
+                  readOnly
+                  spellCheck={false}
+                  aria-label="将发送的原始任务全文"
+                />
+                <p>原文可能包含名称、项目或业务信息。本次内容不会写入本机搜索缓存或日志。</p>
+                <p className="consent-expiry">授权短时有效；失效后需要重新匹配。</p>
+                <div className="raw-consent-actions" aria-busy={phase === "raw-searching"}>
+                  <button
+                    className="raw-confirm-button"
+                    type="button"
+                    onClick={() => void controller.confirmOriginalSearch()}
+                    disabled={phase === "raw-searching"}
+                  >
+                    {phase === "raw-searching" ? "正在发送并搜索…" : "确认发送原文到 GitHub"}
+                  </button>
+                  <button
+                    className="raw-cancel-button"
+                    type="button"
+                    onClick={() => void controller.cancelOriginalSearch()}
+                    disabled={phase === "raw-searching"}
+                  >
+                    取消
+                  </button>
+                </div>
+              </section>
+            </>
           )}
+
+          {phase === "raw-revoking" && (
+            <section
+              className="raw-revoke-status"
+              aria-live="polite"
+              aria-busy={phase === "raw-revoking"}
+            >
+              <p role="status">正在撤销授权…</p>
+              <div className="raw-revoke-actions">
+                <button type="button" disabled>正在撤销授权…</button>
+              </div>
+            </section>
+          )}
+          {phase === "raw-revoke-error" && (
+            <section className="raw-revoke-status" aria-live="polite" aria-busy={false}>
+              <p className="inline-error" role="alert">
+                未能确认撤销，请重试取消或等待授权自动失效。
+              </p>
+              <div className="raw-revoke-actions">
+                <button type="button" onClick={() => void controller.cancelOriginalSearch()}>
+                  重试取消
+                </button>
+              </div>
+            </section>
+          )}
+
+          {phase === "cancelled" && (
+            <p className="empty-inline" role="status">已取消，原始任务未发送。</p>
+          )}
+          {phase === "raw-error" && error?.stage === "original" && (
+            <p className="inline-error" role="alert">{errorMessage}</p>
+          )}
+          {originalOutcome === "empty" && (
+            <p className="empty-inline">已发送原文，但仍没有找到经过验证的相关 Skill。</p>
+          )}
+          {originalOutcome === "incomplete" && (
+            <p className="incomplete-note">原文搜索返回的结果不完整。请修改任务后重新匹配。</p>
+          )}
+
+          {results?.length === 0 && githubResults?.map((result) => (
+            <article className="github-result" key={`${result.repository}/${result.skillDirectory}`}>
+              <div className="github-result-heading">
+                <div>
+                  <strong>{result.name}</strong>
+                  <p>{result.summary}</p>
+                </div>
+                <span className="repo-stars" aria-label={`仓库 Star ${result.stars.toLocaleString()}`}>
+                  ★ {result.stars.toLocaleString()}
+                </span>
+              </div>
+              <p className="github-reason">{result.reasonZh}</p>
+              <dl className="github-metadata">
+                <div><dt>仓库</dt><dd>{result.repository}</dd></div>
+                <div><dt>Skill 目录</dt><dd>{result.skillDirectory}</dd></div>
+                <div><dt>更新时间</dt><dd>{result.pushedAt ? formatDate(result.pushedAt) : "未知"}</dd></div>
+                <div><dt>许可证</dt><dd>{result.license?.trim() || "未标注"}</dd></div>
+              </dl>
+              <a className="external-link" href={result.repositoryUrl} target="_blank" rel="noreferrer">
+                查看 GitHub
+              </a>
+            </article>
+          ))}
         </div>
       </div>
     </section>

@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import test from "node:test";
+import { MAX_GITHUB_REPOSITORY_QUERY_CHARACTERS } from "../lib/github-query-contract.mjs";
 import {
+  buildOriginalGitHubRepositoryQueries,
   buildGitHubRepositoryQueries,
   buildGitHubSearchPreview,
 } from "../lib/github-query.mjs";
@@ -43,6 +45,21 @@ test("maps QR code and Airtable tasks to controlled capability terms", () => {
   );
 });
 
+test("maps data checking tasks to fixed validation terms", () => {
+  assert.deepEqual(
+    buildGitHubSearchPreview("检测数据")?.terms,
+    ["data validation", "testing", "skill"],
+  );
+  assert.deepEqual(
+    buildGitHubSearchPreview("validate data for Acme customer")?.terms,
+    ["data validation", "testing", "skill"],
+  );
+  assert.doesNotMatch(
+    JSON.stringify(buildGitHubSearchPreview("检测星河项目客户数据")),
+    /星河|客户/u,
+  );
+});
+
 test("returns null when neither a controlled capability nor action matches", () => {
   assert.equal(buildGitHubSearchPreview("星河项目内部并购计划"), null);
   assert.equal(buildGitHubSearchPreview("acme confidential merger plans"), null);
@@ -52,7 +69,7 @@ test("strips markdown code and path variants before matching capability rules", 
   const privatePath = join("/", "Users", "alice", "pdf", "secret.txt");
   const assignedPath = join("/", "Users", "alice", "word", "secret.txt");
   const task = [
-    "check `ppt`",
+    "please `ppt`",
     "~/private/ui/notes.txt",
     `file://${privatePath}`,
     String.raw`\\server\share\xhs\private.txt`,
@@ -117,6 +134,78 @@ test("builds best-match and star-sorted repository searches", () => {
   assert.match(queries[0].q, /SKILL\.md/);
   assert.match(queries[0].q, /archived:false/);
   assert.equal(queries[0].q, queries[1].q);
+});
+
+test("builds original searches from the exact displayed task without truncation", () => {
+  const query = "检测 Acme 数据";
+  const searches = buildOriginalGitHubRepositoryQueries(query);
+  assert.equal(
+    searches[0].q,
+    `${query} "SKILL.md" in:name,description,readme archived:false`,
+  );
+  assert.equal(searches[1].q, searches[0].q);
+  assert.deepEqual(searches.map(({ mode }) => mode), ["best-match", "stars"]);
+});
+
+test("rejects an original query that cannot be sent whole", () => {
+  assert.throws(
+    () => buildOriginalGitHubRepositoryQueries("x".repeat(256)),
+    (error) => error.code === "github-query-rejected" &&
+      !error.message.includes("x".repeat(32)),
+  );
+});
+
+test("defines rejected-query error codes without inherited getters or setters", () => {
+  const previousCodeDescriptor = Object.getOwnPropertyDescriptor(Object.prototype, "code");
+  let getterCalls = 0;
+  let setterCalls = 0;
+  let caught;
+  Object.defineProperty(Object.prototype, "code", {
+    configurable: true,
+    get() {
+      getterCalls += 1;
+      return "polluted-error-code";
+    },
+    set() {
+      setterCalls += 1;
+    },
+  });
+  try {
+    buildOriginalGitHubRepositoryQueries("x".repeat(256));
+  } catch (error) {
+    caught = error;
+  } finally {
+    if (previousCodeDescriptor) {
+      Object.defineProperty(Object.prototype, "code", previousCodeDescriptor);
+    } else {
+      delete Object.prototype.code;
+    }
+  }
+  assert.equal(getterCalls, 0);
+  assert.equal(setterCalls, 0);
+  assert.equal(Object.hasOwn(caught, "code"), true);
+  assert.equal(caught.code, "github-query-rejected");
+});
+
+test("counts the complete original repository query by Unicode code points", () => {
+  assert.equal(MAX_GITHUB_REPOSITORY_QUERY_CHARACTERS, 256);
+  const suffix = ' "SKILL.md" in:name,description,readme archived:false';
+  const acceptedOriginal = "😀".repeat(
+    MAX_GITHUB_REPOSITORY_QUERY_CHARACTERS - [...suffix].length,
+  );
+  const accepted = buildOriginalGitHubRepositoryQueries(acceptedOriginal);
+  assert.equal([...accepted[0].q].length, MAX_GITHUB_REPOSITORY_QUERY_CHARACTERS);
+  assert.equal(accepted[0].q, `${acceptedOriginal}${suffix}`);
+
+  const rejectedOriginal = "😀".repeat(
+    MAX_GITHUB_REPOSITORY_QUERY_CHARACTERS + 1 - [...suffix].length,
+  );
+  assert.throws(
+    () => buildOriginalGitHubRepositoryQueries(rejectedOriginal),
+    (error) => error.code === "github-query-rejected" &&
+      error.status === 422 &&
+      !error.message.includes("😀"),
+  );
 });
 
 test("caps externally supplied repository terms at six and 128 total characters", () => {

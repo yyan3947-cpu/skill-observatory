@@ -2,6 +2,39 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createGitHubClient } from "../lib/github-client.mjs";
+import { MAX_GITHUB_REPOSITORY_QUERY_CHARACTERS } from "../lib/github-query-contract.mjs";
+
+test("defines client error codes without inherited getters or setters", () => {
+  const previousCodeDescriptor = Object.getOwnPropertyDescriptor(Object.prototype, "code");
+  let getterCalls = 0;
+  let setterCalls = 0;
+  let caught;
+  Object.defineProperty(Object.prototype, "code", {
+    configurable: true,
+    get() {
+      getterCalls += 1;
+      return "polluted-error-code";
+    },
+    set() {
+      setterCalls += 1;
+    },
+  });
+  try {
+    createGitHubClient({ fetchImpl: null });
+  } catch (error) {
+    caught = error;
+  } finally {
+    if (previousCodeDescriptor) {
+      Object.defineProperty(Object.prototype, "code", previousCodeDescriptor);
+    } else {
+      delete Object.prototype.code;
+    }
+  }
+  assert.equal(getterCalls, 0);
+  assert.equal(setterCalls, 0);
+  assert.equal(Object.hasOwn(caught, "code"), true);
+  assert.equal(caught.code, "invalid-github-client");
+});
 
 test("GitHub client only calls api.github.com and exposes rate limits", async () => {
   const calls = [];
@@ -97,6 +130,103 @@ test("GitHub client maps limits without exposing response bodies", async () => {
       return true;
     },
   );
+});
+
+test("maps GitHub query rejection without reading the remote body", async () => {
+  let bodyReads = 0;
+  const client = createGitHubClient({
+    fetchImpl: async () => ({
+      status: 422,
+      ok: false,
+      headers: new Headers(),
+      async json() {
+        bodyReads += 1;
+        return { message: "remote-body-secret" };
+      },
+    }),
+  });
+  await assert.rejects(
+    () => client.searchRepositories({ q: "valid query" }),
+    (error) => error.code === "github-query-rejected" &&
+      error.status === 422 &&
+      !error.message.includes("remote-body-secret"),
+  );
+  assert.equal(bodyReads, 0);
+});
+
+test("keeps Git tree HTTP 422 as a generic request failure", async () => {
+  let bodyReads = 0;
+  const client = createGitHubClient({
+    fetchImpl: async () => ({
+      status: 422,
+      ok: false,
+      headers: new Headers(),
+      async json() {
+        bodyReads += 1;
+        return { message: "tree-body-secret" };
+      },
+    }),
+  });
+  await assert.rejects(
+    () => client.getTree({ repository: "owner/repo", defaultBranch: "main" }),
+    (error) => error.code === "github-request-failed" &&
+      error.status === 422 &&
+      !error.message.includes("tree-body-secret"),
+  );
+  assert.equal(bodyReads, 0);
+});
+
+test("keeps content HTTP 422 as a generic request failure", async () => {
+  let bodyReads = 0;
+  const client = createGitHubClient({
+    fetchImpl: async () => ({
+      status: 422,
+      ok: false,
+      headers: new Headers(),
+      async json() {
+        bodyReads += 1;
+        return { message: "content-body-secret" };
+      },
+    }),
+  });
+  await assert.rejects(
+    () => client.getTextContent({
+      repository: "owner/repo",
+      skillPath: "skill/SKILL.md",
+      defaultBranch: "main",
+    }),
+    (error) => error.code === "github-request-failed" &&
+      error.status === 422 &&
+      !error.message.includes("content-body-secret"),
+  );
+  assert.equal(bodyReads, 0);
+});
+
+test("enforces the repository query limit by Unicode code points", async () => {
+  const calls = [];
+  const client = createGitHubClient({
+    fetchImpl: async (url) => {
+      calls.push(String(url));
+      return Response.json({ items: [], incomplete_results: false });
+    },
+  });
+  const accepted = "😀".repeat(MAX_GITHUB_REPOSITORY_QUERY_CHARACTERS);
+  await client.searchRepositories({ q: accepted });
+  assert.equal(new URL(calls[0]).searchParams.get("q"), accepted);
+
+  const acceptedAfterTrimming = `${accepted}\u2003`;
+  assert.equal([...acceptedAfterTrimming].length, MAX_GITHUB_REPOSITORY_QUERY_CHARACTERS + 1);
+  await client.searchRepositories({ q: acceptedAfterTrimming });
+  assert.equal(new URL(calls[1]).searchParams.get("q"), accepted);
+
+  const rejected = "😀".repeat(MAX_GITHUB_REPOSITORY_QUERY_CHARACTERS + 1);
+  await assert.rejects(
+    () => client.searchRepositories({ q: rejected }),
+    (error) => error.code === "github-query-rejected" &&
+      error.status === 422 &&
+      !error.message.includes("😀"),
+  );
+  assert.equal(calls.length, 2);
 });
 
 test("GitHub client refuses oversized decoded text", async () => {

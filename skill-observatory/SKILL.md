@@ -23,16 +23,18 @@ Manage the private local Skill catalog through deterministic bundled scripts. Re
 
 Prefer the synchronized local matcher. Preserve status labels such as `可用`, `需配置`, `异常`, and `待检查` when reporting results.
 
-When local matching returns no qualified result, show the GitHub search preview and wait for explicit user action before making the external request. Send only the displayed capability keywords. Treat repository Stars as repository-level metadata, not a Skill rating.
+本地匹配始终先运行。有本地结果时不访问 GitHub；本地零结果后，系统自动发送界面展示的受控脱敏能力词，且不会把未识别的名称、项目名或自由文本混入这一阶段的请求。
 
-Return at most three structurally validated candidates with their repository, Skill subpath, Stars, update time, and source link. Never install, update, or execute a suggested third-party Skill automatically. Ask separately before any later installation.
+脱敏搜索完整零结果，或无法形成安全能力词时，界面会完整展示原始任务。只有用户逐次点击 `确认发送原文到 GitHub` 后，原文才会外发；原文不写入搜索缓存或日志。限流、超时、网络失败或验证不完整只允许重试脱敏搜索，不会发放原文许可。
+
+GitHub 搜索不承诺一定找到匹配项。系统返回最多三个经过结构验证的候选，主要按仓库 Stars 排序；Stars 是仓库关注度，不是 Skill 评分、安全认证或可用性保证。建议不会自动安装、更新或执行；任何后续安装仍需单独审阅和批准。
 
 ## Safety boundaries
 
 - Keep runtime state under `$CODEX_HOME/state/skill-observatory/`, or `~/.codex/state/skill-observatory/` when `CODEX_HOME` is unset. Accept only an absolute `SKILL_OBSERVATORY_DATA_DIR` override.
 - Keep the service on `127.0.0.1`; do not expose it to the LAN or deploy it publicly.
 - Never install Node.js, npm, Homebrew, GitHub CLI, or other system packages.
-- Never read browser Cookies or persist `GITHUB_TOKEN`. Use an explicitly supplied token only from the server process environment.
+- Never read browser Cookies or persist `GITHUB_TOKEN`. Use an explicitly supplied token only from the server process environment. A token can raise API limits but never bypasses per-task confirmation before sending original text.
 - Preserve existing state and a customized `skill-radar` when a conflict is reported.
 - Treat malformed, non-private, linked, or special-file private overrides as a blocking setup/sync error; never silently discard them.
 

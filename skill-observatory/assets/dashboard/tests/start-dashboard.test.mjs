@@ -27,4 +27,17 @@ test("npm and open child processes never inherit GITHUB_TOKEN", async () => {
   const source = await readFile(new URL("../scripts/start-dashboard.mjs", import.meta.url), "utf8");
   assert.doesNotMatch(source, /from ["']node:child_process["']/u);
   assert.equal((source.match(/spawnSanitized\(/gu) ?? []).length, 2);
+  assert.match(source, /findGitHubSkillSuggestionsFromOriginalQuery/u);
+
+  const sanitizedWiring = source.match(
+    /findGitHubSuggestions:\s*\(\{ query \}\)\s*=>\s*findGitHubSkillSuggestions\(\{(?<body>[\s\S]*?)\n\s*\}\),/u,
+  )?.groups?.body;
+  const originalWiring = source.match(
+    /findOriginalGitHubSuggestions:\s*\(\{ query \}\)\s*=>\s*findGitHubSkillSuggestionsFromOriginalQuery\(\{(?<body>[\s\S]*?)\n\s*\}\),/u,
+  )?.groups?.body;
+  assert.ok(sanitizedWiring);
+  assert.ok(originalWiring);
+  assert.match(sanitizedWiring, /cachePath:\s*runtimePaths\.githubCachePath/u);
+  assert.doesNotMatch(originalWiring, /cachePath|githubCachePath/u);
+  assert.match(originalWiring, /token:\s*process\.env\.GITHUB_TOKEN/u);
 });

@@ -33,3 +33,15 @@ export const DEFAULT_API_HOST = "127.0.0.1";
 export const DEFAULT_API_PORT = 4318;
 export const MAX_QUERY_BYTES = 4096;
 export const MAX_REQUEST_BODY_BYTES = 8192;
+export const MIN_CONSENT_TOKEN_CHARACTERS = 16;
+export const MAX_CONSENT_TOKEN_CHARACTERS = 512;
+
+export function isValidConsentToken(value) {
+  return (
+    typeof value === "string" &&
+    value.length >= MIN_CONSENT_TOKEN_CHARACTERS &&
+    value.length <= MAX_CONSENT_TOKEN_CHARACTERS &&
+    value === value.trim() &&
+    /^[A-Za-z0-9_-]+$/u.test(value)
+  );
+}
