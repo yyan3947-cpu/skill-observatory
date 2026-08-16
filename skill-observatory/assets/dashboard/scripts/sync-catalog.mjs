@@ -2,9 +2,10 @@ import { access } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { atomicWriteJson, readJsonFile } from "../lib/cache.mjs";
-import { syncCatalog } from "../lib/catalog.mjs";
+import { atomicWriteJson } from "../lib/cache.mjs";
+import { curateMissingOverrides, syncCatalog } from "../lib/catalog.mjs";
 import { resolveRuntimePaths } from "../lib/runtime-paths.mjs";
+import { readPrivateSkillOverrides } from "../lib/skill-overrides.mjs";
 
 const projectRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const runtimePaths = resolveRuntimePaths({ projectRoot, homeDir: homedir(), env: process.env });
@@ -35,19 +36,9 @@ async function run() {
   });
 
   if (curateMissing) {
-    const overridePath = join(projectRoot, "data", "skill-overrides.json");
-    const overrides = await readJsonFile(overridePath, {});
-    let changed = false;
-    for (const skill of catalog.skills) {
-      if (overrides[skill.name]?.summaryZh) continue;
-      overrides[skill.name] = {
-        summaryZh: skill.summaryZh,
-        category: skill.category,
-        aliases: [...new Set(skill.aliases ?? [])],
-        requiredEnvNames: skill.requiredEnvNames ?? [],
-      };
-      changed = true;
-    }
+    const overridePath = runtimePaths.skillOverridesPath;
+    const currentOverrides = await readPrivateSkillOverrides(overridePath);
+    const { overrides, changed } = curateMissingOverrides(currentOverrides, catalog.skills);
     if (changed) {
       const sorted = Object.fromEntries(Object.entries(overrides).sort(([a], [b]) => a.localeCompare(b)));
       await atomicWriteJson(overridePath, sorted);

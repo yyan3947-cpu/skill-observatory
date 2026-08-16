@@ -13,7 +13,7 @@ Manage the private local Skill catalog through deterministic bundled scripts. Re
    - Run `node scripts/setup.mjs --dry-run` first.
    - Explain the reported filesystem and dependency actions.
    - Obtain explicit approval before running `node scripts/setup.mjs` because it writes private state, runs `npm ci`, and installs the bundled `skill-radar`.
-   - Add `--migrate-from "/absolute/legacy/state"` only when the user asks to preserve an earlier catalog. Keep the source unchanged.
+   - Add `--migrate-from "/absolute/legacy/state"` only when the user asks to preserve an earlier catalog. Private matching rules are separate: when present, also add `--migrate-overrides-from "/absolute/legacy/data/skill-overrides.json"`. Keep both sources unchanged.
 2. Run `node scripts/start.mjs` to synchronize, start the loopback-only API and dashboard, and open the page.
 3. Run `node scripts/sync.mjs` to refresh the catalog without opening the dashboard. Forward `--full` only when a full history rebuild is needed.
 4. Run `node scripts/verify.mjs` for static and test verification. Add `--live` only when the dashboard is already running and the user wants live API/UI checks.
@@ -34,5 +34,6 @@ Return at most three structurally validated candidates with their repository, Sk
 - Never install Node.js, npm, Homebrew, GitHub CLI, or other system packages.
 - Never read browser Cookies or persist `GITHUB_TOKEN`. Use an explicitly supplied token only from the server process environment.
 - Preserve existing state and a customized `skill-radar` when a conflict is reported.
+- Treat malformed, non-private, linked, or special-file private overrides as a blocking setup/sync error; never silently discard them.
 
 Read [references/operations.md](references/operations.md) for exact commands, migration details, launcher behavior, and troubleshooting.

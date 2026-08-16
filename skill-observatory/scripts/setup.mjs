@@ -29,6 +29,11 @@ const MIGRATED_FILES = Object.freeze([
   "history-cache.json",
   "skill-validations.json",
 ]);
+const MAX_OVERRIDE_BYTES = 1024 * 1024;
+const FORBIDDEN_OVERRIDE_KEYS = new Set(["__proto__", "prototype", "constructor"]);
+const OVERRIDE_STRING_FIELDS = new Set(["summaryZh", "category", "statusOverride"]);
+const OVERRIDE_ARRAY_FIELDS = new Set(["aliases", "intentTags", "requiredEnvNames", "statusReasons"]);
+const OVERRIDE_STATUS_VALUES = new Set(["ready", "needs-config", "abnormal", "unchecked"]);
 export const SETUP_MARKER_NAME = "setup-complete.json";
 
 export { installSkillRadar, resolveSkillRoot };
@@ -124,6 +129,125 @@ async function pathExists(path) {
   }
 }
 
+function isPlainRecord(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function containsUnsupportedOverrideControl(value) {
+  for (const character of value) {
+    const codePoint = character.codePointAt(0);
+    if (codePoint === 0 || (codePoint < 32 && ![9, 10, 13].includes(codePoint)) || codePoint === 127) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function validOverrideString(value, maximumLength) {
+  return typeof value === "string"
+    && value.length <= maximumLength
+    && !containsUnsupportedOverrideControl(value);
+}
+
+function assertMigratableOverrideJson(source, errorCode) {
+  if (source.length > MAX_OVERRIDE_BYTES) throw new Error(errorCode);
+  let text;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(source);
+  } catch {
+    throw new Error(errorCode);
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error(errorCode);
+  }
+  if (!isPlainRecord(parsed)) throw new Error(errorCode);
+  for (const name of Object.keys(parsed)) {
+    if (
+      !validOverrideString(name, 256)
+      || name.trim() !== name
+      || name.length === 0
+    ) {
+      throw new Error(errorCode);
+    }
+    const entry = parsed[name];
+    if (!isPlainRecord(entry)) throw new Error(errorCode);
+    for (const key of Object.keys(entry)) {
+      if (FORBIDDEN_OVERRIDE_KEYS.has(key)) throw new Error(errorCode);
+      if (OVERRIDE_STRING_FIELDS.has(key)) {
+        if (!validOverrideString(entry[key], key === "summaryZh" ? 4096 : 256)) {
+          throw new Error(errorCode);
+        }
+        if (key === "statusOverride" && !OVERRIDE_STATUS_VALUES.has(entry[key])) {
+          throw new Error(errorCode);
+        }
+        continue;
+      }
+      if (
+        !OVERRIDE_ARRAY_FIELDS.has(key)
+        || !Array.isArray(entry[key])
+        || entry[key].length > 256
+        || entry[key].some((item) => !validOverrideString(item, 1024))
+      ) {
+        throw new Error(errorCode);
+      }
+      if (
+        (key === "intentTags" && entry[key].some((item) => !/^[a-z][a-z0-9-]{1,63}$/u.test(item)))
+        || (key === "requiredEnvNames" && entry[key].some((item) => !/^[A-Z][A-Z0-9_]+$/u.test(item)))
+      ) {
+        throw new Error(errorCode);
+      }
+    }
+  }
+}
+
+function sameOpenedFile(left, right) {
+  return left.dev === right.dev
+    && left.ino === right.ino
+    && left.size === right.size
+    && left.mtimeMs === right.mtimeMs
+    && left.ctimeMs === right.ctimeMs;
+}
+
+async function readStableOverrideFile(path, {
+  fileErrorCode,
+  jsonErrorCode,
+  requirePrivateMode = false,
+  missing = false,
+}) {
+  let handle;
+  try {
+    handle = await open(
+      path,
+      fileConstants.O_RDONLY | fileConstants.O_NOFOLLOW | fileConstants.O_NONBLOCK,
+    );
+  } catch (error) {
+    if (missing && error.code === "ENOENT") return null;
+    throw new Error(fileErrorCode);
+  }
+  try {
+    const before = await handle.stat();
+    if (
+      !before.isFile()
+      || before.size > MAX_OVERRIDE_BYTES
+      || (requirePrivateMode && (before.mode & 0o777) !== 0o600)
+    ) {
+      throw new Error(fileErrorCode);
+    }
+    const data = await handle.readFile();
+    const after = await handle.stat();
+    if (!sameOpenedFile(before, after)) throw new Error(fileErrorCode);
+    assertMigratableOverrideJson(data, jsonErrorCode);
+    return { data, metadata: after };
+  } finally {
+    await handle.close().catch(() => {});
+  }
+}
+
 export async function migrateRuntimeState({ sourceDirectory, destinationDirectory }) {
   if (!isAbsolute(sourceDirectory)) throw new Error("absolute-migration-source-required");
   const sourceMetadata = await lstat(sourceDirectory);
@@ -180,6 +304,66 @@ export async function migrateRuntimeState({ sourceDirectory, destinationDirector
   return { copied, skipped };
 }
 
+export async function migrateSkillOverrides({ sourcePath, destinationDirectory }) {
+  if (!isAbsolute(sourcePath)) throw new Error("absolute-override-migration-source-required");
+  await ensurePrivateRuntimeDirectory(destinationDirectory);
+  const fileName = "skill-overrides.json";
+  const destinationPath = join(destinationDirectory, fileName);
+  const existing = await readStableOverrideFile(destinationPath, {
+    fileErrorCode: "override-migration-destination-file-required",
+    jsonErrorCode: "override-migration-destination-json-object-required",
+    requirePrivateMode: true,
+    missing: true,
+  });
+  if (existing) return { copied: [], skipped: [fileName] };
+
+  const source = await readStableOverrideFile(sourcePath, {
+    fileErrorCode: "override-migration-source-file-required",
+    jsonErrorCode: "override-migration-json-object-required",
+  });
+  const temporaryPath = join(destinationDirectory, `.${fileName}.${randomUUID()}.tmp`);
+  const handle = await open(temporaryPath, "wx", 0o600);
+  try {
+    await handle.writeFile(source.data);
+  } catch (error) {
+    await handle.close();
+    await unlink(temporaryPath).catch(() => {});
+    throw error;
+  }
+  await handle.close();
+  await chmod(temporaryPath, 0o600);
+  try {
+    await link(temporaryPath, destinationPath);
+  } catch (error) {
+    await unlink(temporaryPath).catch(() => {});
+    if (error.code === "EEXIST") {
+      await readStableOverrideFile(destinationPath, {
+        fileErrorCode: "override-migration-destination-file-required",
+        jsonErrorCode: "override-migration-destination-json-object-required",
+        requirePrivateMode: true,
+      });
+      return { copied: [], skipped: [fileName] };
+    }
+    throw error;
+  }
+  try {
+    const temporaryMetadata = await lstat(temporaryPath);
+    const destinationMetadata = await lstat(destinationPath);
+    if (
+      !destinationMetadata.isFile()
+      || destinationMetadata.isSymbolicLink()
+      || temporaryMetadata.dev !== destinationMetadata.dev
+      || temporaryMetadata.ino !== destinationMetadata.ino
+      || (destinationMetadata.mode & 0o777) !== 0o600
+    ) {
+      throw new Error("override-migration-destination-file-required");
+    }
+  } finally {
+    await unlink(temporaryPath).catch(() => {});
+  }
+  return { copied: [fileName], skipped: [] };
+}
+
 export function checkNpmAvailability({ env = process.env, accessSyncImpl = accessSync } = {}) {
   const executable = String(env.PATH ?? "")
     .split(delimiter)
@@ -214,6 +398,7 @@ export function runNpmCi(dashboardRoot, { spawnSyncImpl = spawnSync, env = proce
 export function parseSetupArguments(args) {
   let dryRun = false;
   let migrateFrom;
+  let migrateOverridesFrom;
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
     if (argument === "--dry-run") {
@@ -226,10 +411,19 @@ export function parseSetupArguments(args) {
       index += 1;
       continue;
     }
+    if (argument === "--migrate-overrides-from") {
+      migrateOverridesFrom = args[index + 1];
+      if (!migrateOverridesFrom) throw new Error("missing-override-migration-source");
+      index += 1;
+      continue;
+    }
     throw new Error(`unknown-argument:${argument}`);
   }
   if (migrateFrom && !isAbsolute(migrateFrom)) throw new Error("absolute-migration-source-required");
-  return { dryRun, migrateFrom };
+  if (migrateOverridesFrom && !isAbsolute(migrateOverridesFrom)) {
+    throw new Error("absolute-override-migration-source-required");
+  }
+  return { dryRun, migrateFrom, migrateOverridesFrom };
 }
 
 export async function runSetup({
@@ -239,6 +433,7 @@ export async function runSetup({
   nodeVersion = process.versions.node,
   dryRun = false,
   migrateFrom,
+  migrateOverridesFrom,
   npmCheck = checkNpmAvailability,
   installDependencies = runNpmCi,
   radarInstaller = installSkillRadar,
@@ -254,6 +449,9 @@ export async function runSetup({
   const stateDirectory = resolveRuntimeStateDirectory({ env, homeDirectory });
   const radarDestinationRoot = join(codexRoot, "skills", "skill-radar");
   if (migrateFrom && !isAbsolute(migrateFrom)) throw new Error("absolute-migration-source-required");
+  if (migrateOverridesFrom && !isAbsolute(migrateOverridesFrom)) {
+    throw new Error("absolute-override-migration-source-required");
+  }
 
   const plan = {
     dashboardRoot,
@@ -261,6 +459,7 @@ export async function runSetup({
     radarTemplateRoot,
     radarDestinationRoot,
     migrateFrom,
+    migrateOverridesFrom,
     nodeVersion: versionCheck.actual,
     npmExecutable: npm.executable,
   };
@@ -275,6 +474,14 @@ export async function runSetup({
     const migration = migrateFrom
       ? await migrateRuntimeState({ sourceDirectory: migrateFrom, destinationDirectory: stateDirectory })
       : { copied: [], skipped: [] };
+    if (migrateOverridesFrom) {
+      const overrideMigration = await migrateSkillOverrides({
+        sourcePath: migrateOverridesFrom,
+        destinationDirectory: stateDirectory,
+      });
+      migration.copied.push(...overrideMigration.copied);
+      migration.skipped.push(...overrideMigration.skipped);
+    }
     await installDependencies(dashboardRoot, { env });
     const radarStatus = await radarInstaller({
       templateRoot: radarTemplateRoot,

@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, realpath, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { readCatalog, syncCatalog } from "../lib/catalog.mjs";
+import { curateMissingOverrides, readCatalog, syncCatalog } from "../lib/catalog.mjs";
+import { recommendSkills } from "../lib/recommend.mjs";
+import { mergeSkillOverrides } from "../lib/skill-overrides.mjs";
 
 async function writeSkill(homeDir, folder, document) {
   const directory = join(homeDir, ".codex", "skills", folder);
@@ -76,6 +78,122 @@ test("builds a complete private catalog with curated summaries and exact aggrega
   assert.equal((await stat(join(dataDirectory, "catalog.json"))).mode & 0o777, 0o600);
   assert.equal((await readCatalog(dataDirectory)).schemaVersion, catalog.schemaVersion);
   assert.doesNotMatch(JSON.stringify(catalog), /private-fixture-thread/);
+});
+
+test("private runtime overrides survive distribution sync and preserve task matching", async () => {
+  const root = await mkdtemp(join(tmpdir(), "skill-observatory-private-overrides-"));
+  const homeDir = join(root, "home");
+  const projectRoot = join(root, "project");
+  const dataDirectory = join(root, "private-state");
+  await mkdir(join(projectRoot, "data"), { recursive: true });
+  await mkdir(dataDirectory, { recursive: true, mode: 0o700 });
+  await writeFile(join(projectRoot, "data", "skill-overrides.json"), "{}\n", "utf8");
+  await writeFile(join(dataDirectory, "skill-overrides.json"), `${JSON.stringify({
+    "agent-reach": {
+      summaryZh: "检索互联网公开信息。",
+      intentTags: ["web-research"],
+    },
+    "market-news-analyst": {
+      summaryZh: "分析近期新闻影响。",
+      intentTags: ["current-affairs", "news-analysis"],
+    },
+  }, null, 2)}\n`, { mode: 0o600 });
+  await writeSkill(homeDir, "agent-reach", "---\nname: agent-reach\ndescription: Search public internet sources.\n---\n");
+  await writeSkill(homeDir, "market-news-analyst", "---\nname: market-news-analyst\ndescription: Analyze recent market news.\n---\n");
+
+  const catalog = await syncCatalog({
+    projectRoot,
+    homeDir,
+    cwd: projectRoot,
+    dataDirectory,
+    fullRebuild: true,
+  });
+
+  assert.deepEqual(
+    catalog.skills.find((skill) => skill.name === "agent-reach").intentTags,
+    ["web-research"],
+  );
+  assert.deepEqual(
+    recommendSkills("搜寻国际时事", catalog).map((item) => item.name),
+    ["market-news-analyst", "agent-reach"],
+  );
+});
+
+test("private overrides replace only their explicit distribution fields", () => {
+  const merged = mergeSkillOverrides({
+    "agent-reach": {
+      summaryZh: "分发版摘要",
+      category: "连接器与自动化",
+      aliases: ["网络调研"],
+      requiredEnvNames: ["TWITTER_AUTH_TOKEN"],
+    },
+  }, {
+    "agent-reach": { intentTags: ["web-research"] },
+  });
+
+  assert.equal(merged["agent-reach"].summaryZh, "分发版摘要");
+  assert.equal(merged["agent-reach"].category, "连接器与自动化");
+  assert.deepEqual(merged["agent-reach"].aliases, ["网络调研"]);
+  assert.deepEqual(merged["agent-reach"].requiredEnvNames, ["TWITTER_AUTH_TOKEN"]);
+  assert.deepEqual(merged["agent-reach"].intentTags, ["web-research"]);
+  assert.equal(Object.getPrototypeOf(merged), null);
+});
+
+test("private override curation preserves intent tags and malformed state fails closed", async () => {
+  const curated = curateMissingOverrides({
+    "agent-reach": { intentTags: ["web-research"] },
+  }, [{
+    name: "agent-reach",
+    summaryZh: "检索互联网公开信息。",
+    category: "连接器与自动化",
+    aliases: ["agent reach"],
+    requiredEnvNames: [],
+  }]);
+  assert.equal(curated.changed, true);
+  assert.deepEqual(curated.overrides["agent-reach"].intentTags, ["web-research"]);
+  assert.equal(curated.overrides["agent-reach"].summaryZh, "检索互联网公开信息。");
+  const reservedName = curateMissingOverrides({}, [{
+    name: "constructor",
+    summaryZh: "合法的 Skill 名称。",
+    category: "其他",
+    aliases: [],
+    requiredEnvNames: [],
+  }]);
+  assert.equal(reservedName.overrides.constructor.summaryZh, "合法的 Skill 名称。");
+
+  const root = await mkdtemp(join(tmpdir(), "skill-observatory-malformed-overrides-"));
+  const homeDir = join(root, "home");
+  const projectRoot = join(root, "project");
+  const dataDirectory = join(root, "private-state");
+  await mkdir(join(projectRoot, "data"), { recursive: true });
+  await mkdir(dataDirectory, { recursive: true, mode: 0o700 });
+  await writeFile(join(projectRoot, "data", "skill-overrides.json"), "{}\n", "utf8");
+  await writeFile(join(dataDirectory, "skill-overrides.json"), "{broken\n", { mode: 0o600 });
+  await writeSkill(homeDir, "agent-reach", "---\nname: agent-reach\ndescription: Search public internet sources.\n---\n");
+
+  await assert.rejects(
+    syncCatalog({ projectRoot, homeDir, cwd: projectRoot, dataDirectory, fullRebuild: true }),
+    /private-skill-overrides-invalid/u,
+  );
+
+  await writeFile(
+    join(dataDirectory, "skill-overrides.json"),
+    '{"agent-reach":{"__proto__":{"intentTags":["web-research"]}}}\n',
+    { mode: 0o600 },
+  );
+  await assert.rejects(
+    syncCatalog({ projectRoot, homeDir, cwd: projectRoot, dataDirectory, fullRebuild: true }),
+    /private-skill-overrides-invalid/u,
+  );
+
+  const outsideOverrides = join(root, "outside-overrides.json");
+  await writeFile(outsideOverrides, "{}\n", { mode: 0o600 });
+  await unlink(join(dataDirectory, "skill-overrides.json"));
+  await symlink(outsideOverrides, join(dataDirectory, "skill-overrides.json"));
+  await assert.rejects(
+    syncCatalog({ projectRoot, homeDir, cwd: projectRoot, dataDirectory, fullRebuild: true }),
+    /private-skill-overrides-invalid/u,
+  );
 });
 
 test("applies path-scoped validation only while the Skill content hash matches", async () => {

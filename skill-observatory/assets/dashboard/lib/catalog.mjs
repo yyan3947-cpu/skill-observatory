@@ -6,6 +6,11 @@ import { discoverSkills } from "./discover.mjs";
 import { analyzeHistory } from "./history.mjs";
 import { normalizeText } from "./recommend.mjs";
 import { ensurePrivateDirectory } from "./runtime-paths.mjs";
+import {
+  mergeSkillOverrides,
+  readPrivateSkillOverrides,
+  validateSkillOverridesDocument,
+} from "./skill-overrides.mjs";
 
 const CATEGORY_RULES = [
   ["小红书与社交内容", /xhs|xiaohongshu|redbook|redfox|小红书|douyin|social|ads-intelligence|media-crawler/i],
@@ -109,6 +114,25 @@ export async function buildScanRoots({ homeDir, codexRoot = join(homeDir, ".code
   return roots;
 }
 
+export function curateMissingOverrides(overrides, skills) {
+  const output = Object.create(null);
+  for (const [name, override] of Object.entries(overrides)) {
+    output[name] = Object.assign(Object.create(null), override);
+  }
+  let changed = false;
+  for (const skill of skills) {
+    if (output[skill.name]?.summaryZh) continue;
+    output[skill.name] = Object.assign(Object.create(null), output[skill.name] ?? {}, {
+      summaryZh: skill.summaryZh,
+      category: skill.category,
+      aliases: [...new Set(skill.aliases ?? [])],
+      requiredEnvNames: skill.requiredEnvNames ?? [],
+    });
+    changed = true;
+  }
+  return { overrides: output, changed };
+}
+
 export async function syncCatalog({
   projectRoot,
   homeDir,
@@ -119,7 +143,12 @@ export async function syncCatalog({
   reminderCatalogPath,
 }) {
   await ensurePrivateDirectory(dataDirectory);
-  const overrides = await readJsonFile(join(projectRoot, "data", "skill-overrides.json"), {});
+  const distributionOverrides = validateSkillOverridesDocument(
+    await readJsonFile(join(projectRoot, "data", "skill-overrides.json"), {}),
+    { errorCode: "distribution-skill-overrides-invalid" },
+  );
+  const privateOverrides = await readPrivateSkillOverrides(join(dataDirectory, "skill-overrides.json"));
+  const overrides = mergeSkillOverrides(distributionOverrides, privateOverrides);
   const validationRegistry = await readJsonFile(join(dataDirectory, "skill-validations.json"), {
     schemaVersion: 1,
     records: {},

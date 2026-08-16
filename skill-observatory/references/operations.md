@@ -30,6 +30,18 @@ node "$SKILL_ROOT/scripts/setup.mjs" --migrate-from "$OBSERVATORY_LEGACY_STATE"
 
 Migration copies only `catalog.json`, `history-cache.json`, and `skill-validations.json`. Existing destination files are preserved and the source directory is never deleted or changed.
 
+If the previous local checkout also has private matching overrides, migrate that file explicitly:
+
+```zsh
+OBSERVATORY_LEGACY_OVERRIDES="/absolute/path/to/old/data/skill-overrides.json"
+node "$SKILL_ROOT/scripts/setup.mjs" \
+  --migrate-from "$OBSERVATORY_LEGACY_STATE" \
+  --migrate-overrides-from "$OBSERVATORY_LEGACY_OVERRIDES"
+```
+
+The override file is copied to private runtime state as `skill-overrides.json` with mode `0600`. It is never added to the published Skill tree, and an existing destination file is preserved.
+The two migration flags are independent. Always pass the override file separately when the earlier installation contains private aliases or intent tags; migrating only the catalog does not preserve those matching rules.
+
 Runtime state defaults to `$CODEX_HOME/state/skill-observatory/`, or `~/.codex/state/skill-observatory/` when `CODEX_HOME` is unset. Set `SKILL_OBSERVATORY_DATA_DIR` only to an absolute directory. The runtime directory must have mode `0700`; state JSON files use mode `0600`.
 
 ## Start and synchronize
@@ -92,6 +104,9 @@ GitHub search occurs only after local matching returns no result and the user cl
 - `npm-ci-failed`: inspect npm output, restore network or registry access, and retry. Do not treat the partial setup as complete.
 - `setup-required`: run the setup dry-run, approve its actions, and complete setup.
 - `private-runtime-directory-required`: use a private directory with exact mode `0700`; do not weaken permissions.
+- `private-skill-overrides-invalid`: repair or restore the private override JSON as a regular `0600` file. Sync fails closed instead of ignoring malformed rules.
+- `override-migration-source-file-required` or `override-migration-json-object-required`: select a regular, non-linked JSON override file with the documented object structure.
+- `override-migration-destination-file-required` or `override-migration-destination-json-object-required`: inspect the existing private-state destination; setup will not trust a symlink, special file, unsafe mode, or malformed JSON.
 - `skill-radar-conflict`: the existing installed `skill-radar` differs from the bundled template. Preserve it and inspect the difference before choosing any manual replacement.
 - `launcher-exists`: preserve the current launcher or rerun with `--replace` only after approval.
 - Dashboard port conflict: check whether both `http://127.0.0.1:4318/api/catalog` and `http://localhost:3000/` are healthy. If not, report the conflict; never terminate an unknown process.

@@ -32,6 +32,7 @@ export function resolveRuntimePaths({ projectRoot, homeDir, env = process.env })
     validationRegistryPath: join(dataDirectory, "skill-validations.json"),
     historyCachePath: join(dataDirectory, "history-cache.json"),
     githubCachePath: join(dataDirectory, "github-suggestions-cache.json"),
+    skillOverridesPath: join(dataDirectory, "skill-overrides.json"),
     radarTemplateDirectory: configuredRadarTemplate
       ? resolve(configuredRadarTemplate)
       : join(projectRoot, "skill-radar"),

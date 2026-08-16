@@ -17,6 +17,7 @@ test("uses CODEX_HOME state directory without writing into the project", () => {
   assert.equal(paths.validationRegistryPath, "/tmp/codex-home/state/skill-observatory/skill-validations.json");
   assert.equal(paths.historyCachePath, "/tmp/codex-home/state/skill-observatory/history-cache.json");
   assert.equal(paths.githubCachePath, "/tmp/codex-home/state/skill-observatory/github-suggestions-cache.json");
+  assert.equal(paths.skillOverridesPath, "/tmp/codex-home/state/skill-observatory/skill-overrides.json");
   assert.equal(paths.radarTemplateDirectory, "/workspace/skill-observatory/skill-radar");
 });
 
