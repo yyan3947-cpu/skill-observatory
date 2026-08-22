@@ -28,6 +28,22 @@ test("npm and open child processes never inherit GITHUB_TOKEN", async () => {
   assert.doesNotMatch(source, /from ["']node:child_process["']/u);
   assert.equal((source.match(/spawnSanitized\(/gu) ?? []).length, 2);
   assert.match(source, /findGitHubSkillSuggestionsFromOriginalQuery/u);
+  assert.match(source, /inspectGitHubTokenEnvelope/u);
+  assert.match(source, /createGitHubStatusService/u);
+  assert.match(source, /const rawGitHubToken = process\.env\.GITHUB_TOKEN/u);
+  assert.match(source, /const tokenEnvelope = inspectGitHubTokenEnvelope\(rawGitHubToken\)/u);
+  assert.match(
+    source,
+    /const serverToken = tokenEnvelope\.state === "candidate" \? tokenEnvelope\.token : ""/u,
+  );
+  assert.doesNotMatch(source, /process\.env\.GITHUB_TOKEN\?\.trim|process\.env\.GITHUB_TOKEN\.trim/u);
+  assert.equal((source.match(/process\.env\.GITHUB_TOKEN/gu) ?? []).length, 1);
+  assert.match(source, /createGitHubStatusService\(\{[\s\S]*?token: serverToken,[\s\S]*?tokenState: tokenEnvelope\.state/u);
+  assert.match(source, /getGitHubStatus:\s*\([^)]*\)\s*=>\s*githubStatusService\.getStatus\(/u);
+  assert.match(source, /githubStatusService\.getStatus\(\{ force: true \}\)\.catch\(\(\) => \{\}\)/u);
+  assert.match(source, /import \{ recommendSkillsWithLevel \} from "\.\.\/lib\/recommend\.mjs";/u);
+  assert.match(source, /recommend:\s*recommendSkillsWithLevel/u);
+  assert.doesNotMatch(source, /recommend:\s*recommendSkills[,\s]/u);
 
   const sanitizedWiring = source.match(
     /findGitHubSuggestions:\s*\(\{ query \}\)\s*=>\s*findGitHubSkillSuggestions\(\{(?<body>[\s\S]*?)\n\s*\}\),/u,
@@ -39,5 +55,7 @@ test("npm and open child processes never inherit GITHUB_TOKEN", async () => {
   assert.ok(originalWiring);
   assert.match(sanitizedWiring, /cachePath:\s*runtimePaths\.githubCachePath/u);
   assert.doesNotMatch(originalWiring, /cachePath|githubCachePath/u);
-  assert.match(originalWiring, /token:\s*process\.env\.GITHUB_TOKEN/u);
+  assert.match(sanitizedWiring, /token:\s*serverToken/u);
+  assert.match(originalWiring, /token:\s*serverToken/u);
+  assert.doesNotMatch(`${sanitizedWiring}\n${originalWiring}`, /process\.env|GITHUB_TOKEN/u);
 });

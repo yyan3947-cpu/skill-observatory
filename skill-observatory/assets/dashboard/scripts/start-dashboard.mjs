@@ -9,10 +9,14 @@ import { DEFAULT_API_HOST, DEFAULT_API_PORT } from "../lib/contracts.mjs";
 import { createLocalApi } from "../lib/local-api.mjs";
 import { buildGitHubSearchPreview } from "../lib/github-query.mjs";
 import {
+  createGitHubStatusService,
+  inspectGitHubTokenEnvelope,
+} from "../lib/github-token-status.mjs";
+import {
   findGitHubSkillSuggestions,
   findGitHubSkillSuggestionsFromOriginalQuery,
 } from "../lib/github-suggestions.mjs";
-import { recommendSkills } from "../lib/recommend.mjs";
+import { recommendSkillsWithLevel } from "../lib/recommend.mjs";
 import { resolveRuntimePaths } from "../lib/runtime-paths.mjs";
 
 const projectRoot = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -20,6 +24,13 @@ const runtimePaths = resolveRuntimePaths({ projectRoot, homeDir: homedir(), env:
 const stagedCatalogPath = join(runtimePaths.radarTemplateDirectory, "references", "catalog.json");
 const installedSkillPath = join(runtimePaths.codexRoot, "skills", "skill-radar", "SKILL.md");
 const installedCatalogPath = join(runtimePaths.codexRoot, "skills", "skill-radar", "references", "catalog.json");
+const rawGitHubToken = process.env.GITHUB_TOKEN;
+const tokenEnvelope = inspectGitHubTokenEnvelope(rawGitHubToken);
+const serverToken = tokenEnvelope.state === "candidate" ? tokenEnvelope.token : "";
+const githubStatusService = createGitHubStatusService({
+  token: serverToken,
+  tokenState: tokenEnvelope.state,
+});
 let child;
 let api;
 let shuttingDown = false;
@@ -72,22 +83,24 @@ async function shutdown(code = 0) {
 }
 
 async function main() {
+  githubStatusService.getStatus({ force: true }).catch(() => {});
   await performSync();
   api = createLocalApi({
     host: DEFAULT_API_HOST,
     port: DEFAULT_API_PORT,
     syncCatalog: performSync,
     getCatalog: () => readCatalog(runtimePaths.dataDirectory),
-    recommend: recommendSkills,
+    recommend: recommendSkillsWithLevel,
+    getGitHubStatus: () => githubStatusService.getStatus(),
     previewGitHubSearch: buildGitHubSearchPreview,
     findGitHubSuggestions: ({ query }) => findGitHubSkillSuggestions({
       query,
       cachePath: runtimePaths.githubCachePath,
-      token: process.env.GITHUB_TOKEN?.trim() || undefined,
+      token: serverToken,
     }),
     findOriginalGitHubSuggestions: ({ query }) => findGitHubSkillSuggestionsFromOriginalQuery({
       query,
-      token: process.env.GITHUB_TOKEN?.trim() || undefined,
+      token: serverToken,
     }),
   });
 

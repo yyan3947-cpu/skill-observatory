@@ -69,6 +69,61 @@ export interface GitHubSearchPreview {
   label: string;
 }
 
+export type GitHubServiceState =
+  | "ready"
+  | "missing-token"
+  | "invalid-token"
+  | "rate-limited"
+  | "github-unavailable";
+
+export type GitHubSearchStage =
+  | "repository-search"
+  | "code-search"
+  | "candidate-validation"
+  | "complete";
+
+export type GitHubRejectionReason =
+  | "invalid-structure"
+  | "invalid-content"
+  | "irrelevant"
+  | "duplicate"
+  | "unavailable";
+
+export interface GitHubRateLimit {
+  remaining: number | null;
+  reset: number | null;
+  retryAt: string | null;
+}
+
+export interface GitHubRateLimits {
+  search: GitHubRateLimit | null;
+  codeSearch: GitHubRateLimit | null;
+}
+
+export interface GitHubServiceStatus {
+  state: GitHubServiceState;
+  checkedAt: string;
+  rateLimits: GitHubRateLimits;
+}
+
+export interface GitHubRejectionCount {
+  reason: GitHubRejectionReason;
+  count: number;
+}
+
+export interface GitHubSearchDiagnostics {
+  stageReached: GitHubSearchStage;
+  repositoryHits: number;
+  codeHits: number;
+  validatedCandidates: number;
+  rejectedCandidates: number;
+  deduplicatedCandidates: number;
+  rejectionCounts: GitHubRejectionCount[];
+  cached: boolean;
+  incomplete: boolean;
+  rateLimits: GitHubRateLimits;
+}
+
 export interface GitHubSkillSuggestion {
   repository: string;
   repositoryUrl: string;
@@ -86,9 +141,13 @@ export interface RawSearchConsent {
   expiresAt: string;
 }
 
+export type LocalMatchLevel = "strong" | "weak" | "none";
+
 export interface TaskRecommendationResponse {
+  localMatchLevel: LocalMatchLevel;
   results: Recommendation[];
   githubSearch: GitHubSearchPreview | null;
+  githubStatus: GitHubServiceStatus | null;
   rawConsent: RawSearchConsent | null;
 }
 
@@ -99,6 +158,7 @@ export interface GitHubSuggestionResponse {
   incomplete: boolean;
   rawConsent: RawSearchConsent | null;
   rateLimit: { remaining: number | null; reset: number | null; retryAt: string | null } | null;
+  diagnostics: GitHubSearchDiagnostics;
 }
 
 export interface FilterState {

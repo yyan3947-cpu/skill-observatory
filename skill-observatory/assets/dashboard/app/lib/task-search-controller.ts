@@ -5,8 +5,12 @@ import {
 } from "./api.ts";
 import type {
   GitHubSearchPreview,
+  GitHubSearchDiagnostics,
+  GitHubSearchStage,
+  GitHubServiceStatus,
   GitHubSkillSuggestion,
   GitHubSuggestionResponse,
+  LocalMatchLevel,
   RawSearchConsent,
   Recommendation,
   TaskRecommendationResponse,
@@ -38,10 +42,14 @@ export interface TaskSearchError {
 export interface TaskSearchState {
   query: string;
   submittedQuery: string;
+  localMatchLevel: LocalMatchLevel | null;
   results: Recommendation[] | null;
   githubSearch: GitHubSearchPreview | null;
   githubResults: GitHubSkillSuggestion[] | null;
   githubIncomplete: boolean;
+  githubStatus: GitHubServiceStatus | null;
+  githubDiagnostics: GitHubSearchDiagnostics | null;
+  githubStage: GitHubSearchStage | null;
   rawConsent: RawSearchConsent | null;
   phase: TaskSearchPhase;
   originalOutcome: OriginalSearchOutcome;
@@ -50,6 +58,7 @@ export interface TaskSearchState {
 
 interface TaskSearchDependencies {
   recommendTask(query: string, signal?: AbortSignal): Promise<TaskRecommendationResponse>;
+  getGitHubStatus?(signal?: AbortSignal): Promise<GitHubServiceStatus>;
   searchSanitizedGitHubSkills(query: string, signal?: AbortSignal): Promise<GitHubSuggestionResponse>;
   searchOriginalGitHubSkills(
     query: string,
@@ -62,10 +71,14 @@ interface TaskSearchDependencies {
 const INITIAL_STATE: TaskSearchState = {
   query: "",
   submittedQuery: "",
+  localMatchLevel: null,
   results: null,
   githubSearch: null,
   githubResults: null,
   githubIncomplete: false,
+  githubStatus: null,
+  githubDiagnostics: null,
+  githubStage: null,
   rawConsent: null,
   phase: "idle",
   originalOutcome: "none",
@@ -106,6 +119,15 @@ export function formatTaskSearchError(error: TaskSearchError | null) {
       ? `GitHub 当前限流，${retry}重试脱敏搜索。`
       : `GitHub 当前限流，${retry}重新匹配并重试原文搜索。`;
   }
+  if (error.code === "github-token-missing") {
+    return "未检测到 GitHub Token，请配置后重新启动看台。";
+  }
+  if (error.code === "github-token-invalid") {
+    return "GitHub Token 无效，请更正后重新启动看台。";
+  }
+  if (error.code === "github-access-denied") {
+    return "GitHub 拒绝了当前 Token 的访问权限，请检查权限后重试。";
+  }
   if (error.code === "local-match-available") {
     return "本机 Skill 已更新，请重新匹配查看本地结果。";
   }
@@ -145,11 +167,79 @@ function normalizeError(value: unknown, stage: TaskSearchErrorStage): TaskSearch
   };
 }
 
+function cloneRateLimits(value: GitHubServiceStatus["rateLimits"]) {
+  const cloneBucket = (bucket: GitHubServiceStatus["rateLimits"]["search"]) => bucket
+    ? { remaining: bucket.remaining, reset: bucket.reset, retryAt: bucket.retryAt }
+    : null;
+  return {
+    search: cloneBucket(value.search),
+    codeSearch: cloneBucket(value.codeSearch),
+  };
+}
+
+function materializeGitHubStatus(status: GitHubServiceStatus | null | undefined) {
+  return status
+    ? {
+        state: status.state,
+        checkedAt: status.checkedAt,
+        rateLimits: cloneRateLimits(status.rateLimits),
+      }
+    : null;
+}
+
+function materializeGitHubDiagnostics(diagnostics: GitHubSearchDiagnostics) {
+  return {
+    stageReached: diagnostics.stageReached,
+    repositoryHits: diagnostics.repositoryHits,
+    codeHits: diagnostics.codeHits,
+    validatedCandidates: diagnostics.validatedCandidates,
+    rejectedCandidates: diagnostics.rejectedCandidates,
+    deduplicatedCandidates: diagnostics.deduplicatedCandidates,
+    rejectionCounts: diagnostics.rejectionCounts.map((item) => ({
+      reason: item.reason,
+      count: item.count,
+    })),
+    cached: diagnostics.cached,
+    incomplete: diagnostics.incomplete,
+    rateLimits: cloneRateLimits(diagnostics.rateLimits),
+  };
+}
+
+function unavailableStatusError(status: GitHubServiceStatus): TaskSearchError | null {
+  const codes: Partial<Record<GitHubServiceStatus["state"], TaskSearchErrorCode>> = {
+    "missing-token": "github-token-missing",
+    "invalid-token": "github-token-invalid",
+    "rate-limited": "github-rate-limited",
+    "github-unavailable": "github-network-failed",
+  };
+  const code = codes[status.state];
+  if (!code) return null;
+  return {
+    stage: "sanitized",
+    code,
+    retryAt: status.state === "rate-limited"
+      ? status.rateLimits.search?.retryAt ?? null
+      : null,
+  };
+}
+
+function normalizeGitHubError(value: unknown, stage: "sanitized" | "original") {
+  const safe = readBrowserApiError(value);
+  return {
+    error: normalizeError(value, stage),
+    githubStage: safe?.stage ?? "repository-search" as GitHubSearchStage,
+  };
+}
+
 export function createTaskSearchController(dependencies: TaskSearchDependencies) {
   let state: TaskSearchState = { ...INITIAL_STATE };
   let requestVersion = 0;
   let requestInFlight = false;
   let activeRequest: AbortController | null = null;
+  let originalConsentInFlight: RawSearchConsent | null = null;
+  let statusVersion = 0;
+  let activeStatusRequest: AbortController | null = null;
+  let statusRequestInFlight: Promise<boolean> | null = null;
   let disposed = false;
   const successfulRevocations = new WeakSet<RawSearchConsent>();
   const inFlightRevocations = new WeakMap<RawSearchConsent, Promise<boolean>>();
@@ -180,6 +270,50 @@ export function createTaskSearchController(dependencies: TaskSearchDependencies)
     activeRequest = null;
   }
 
+  function replaceGitHubStatus(status: GitHubServiceStatus) {
+    statusVersion += 1;
+    activeStatusRequest?.abort();
+    activeStatusRequest = null;
+    statusRequestInFlight = null;
+    const githubStatus = materializeGitHubStatus(status);
+    update({ githubStatus });
+    return githubStatus;
+  }
+
+  function refreshGitHubStatus() {
+    if (disposed || !dependencies.getGitHubStatus) return Promise.resolve(false);
+    if (statusRequestInFlight) return statusRequestInFlight;
+    const controller = new AbortController();
+    const version = statusVersion + 1;
+    statusVersion = version;
+    activeStatusRequest = controller;
+    const request = Promise.resolve()
+      .then(() => dependencies.getGitHubStatus?.(controller.signal))
+      .then((status) => {
+        if (
+          !status ||
+          disposed ||
+          version !== statusVersion ||
+          controller.signal.aborted
+        ) return false;
+        update({ githubStatus: materializeGitHubStatus(status) });
+        return true;
+      }, (error) => {
+        if (
+          disposed ||
+          version !== statusVersion ||
+          (isAbortError(error) && controller.signal.aborted)
+        ) return false;
+        return false;
+      });
+    const tracked = request.finally(() => {
+      if (statusRequestInFlight === tracked) statusRequestInFlight = null;
+      if (activeStatusRequest === controller) activeStatusRequest = null;
+    });
+    statusRequestInFlight = tracked;
+    return tracked;
+  }
+
   function revokeConsent(consent: RawSearchConsent) {
     if (successfulRevocations.has(consent)) return Promise.resolve(true);
     const existing = inFlightRevocations.get(consent);
@@ -205,6 +339,19 @@ export function createTaskSearchController(dependencies: TaskSearchDependencies)
   function revokeConsentBestEffort(consent: RawSearchConsent | null) {
     if (!consent) return;
     void revokeConsent(consent);
+  }
+
+  async function revokeUncertainOriginalConsent(consent: RawSearchConsent) {
+    if (originalConsentInFlight !== consent) {
+      const existing = interactiveRevocations.get(consent) ?? inFlightRevocations.get(consent);
+      if (existing) await existing;
+      return { owned: false, revoked: successfulRevocations.has(consent) };
+    }
+
+    const revoked = await revokeConsent(consent);
+    const owned = originalConsentInFlight === consent;
+    if (owned) originalConsentInFlight = null;
+    return { owned, revoked };
   }
 
   function beginRevocationBarrier(consent: RawSearchConsent) {
@@ -256,6 +403,8 @@ export function createTaskSearchController(dependencies: TaskSearchDependencies)
       githubSearch: preview,
       githubResults: null,
       githubIncomplete: false,
+      githubDiagnostics: null,
+      githubStage: "repository-search",
       rawConsent: null,
       phase: "sanitized-searching",
       originalOutcome: "none",
@@ -269,11 +418,17 @@ export function createTaskSearchController(dependencies: TaskSearchDependencies)
         return;
       }
       const githubResults = response.results.slice(0, 3);
-      if (response.incomplete) {
+      const githubDiagnostics = materializeGitHubDiagnostics(response.diagnostics);
+      const responseIncomplete = response.incomplete ||
+        githubDiagnostics.incomplete ||
+        githubDiagnostics.stageReached !== "complete";
+      if (responseIncomplete) {
         revokeConsentBestEffort(responseConsent);
         update({
           githubResults,
           githubIncomplete: true,
+          githubDiagnostics,
+          githubStage: githubDiagnostics.stageReached,
           rawConsent: null,
           phase: "sanitized-error",
           error: null,
@@ -282,6 +437,8 @@ export function createTaskSearchController(dependencies: TaskSearchDependencies)
         update({
           githubResults,
           githubIncomplete: false,
+          githubDiagnostics,
+          githubStage: githubDiagnostics.stageReached,
           rawConsent: responseConsent,
           phase: "raw-consent",
           error: null,
@@ -291,6 +448,8 @@ export function createTaskSearchController(dependencies: TaskSearchDependencies)
         update({
           githubResults,
           githubIncomplete: false,
+          githubDiagnostics,
+          githubStage: githubDiagnostics.stageReached,
           rawConsent: null,
           phase: "sanitized-error",
           error: { stage: "sanitized", code: "raw-consent-unavailable", retryAt: null },
@@ -300,6 +459,8 @@ export function createTaskSearchController(dependencies: TaskSearchDependencies)
         update({
           githubResults,
           githubIncomplete: false,
+          githubDiagnostics,
+          githubStage: githubDiagnostics.stageReached,
           rawConsent: null,
           phase: "complete",
           error: null,
@@ -307,12 +468,15 @@ export function createTaskSearchController(dependencies: TaskSearchDependencies)
       }
     } catch (error) {
       if (!isCurrent(version) || (isAbortError(error) && signal.aborted)) return;
+      const normalized = normalizeGitHubError(error, "sanitized");
       update({
         githubResults: null,
         githubIncomplete: false,
+        githubDiagnostics: null,
+        githubStage: normalized.githubStage,
         rawConsent: null,
         phase: "sanitized-error",
-        error: normalizeError(error, "sanitized"),
+        error: normalized.error,
       });
     }
   }
@@ -326,6 +490,7 @@ export function createTaskSearchController(dependencies: TaskSearchDependencies)
       listeners.add(listener);
       return () => listeners.delete(listener);
     },
+    refreshGitHubStatus,
     changeQuery(value: string) {
       if (disposed) return;
       if (state.phase === "raw-consent" && value.trim() === state.submittedQuery) {
@@ -336,18 +501,21 @@ export function createTaskSearchController(dependencies: TaskSearchDependencies)
       requestInFlight = false;
       activeRequest?.abort();
       activeRequest = null;
-      const abandonedConsent = state.rawConsent;
+      const abandonedConsent = state.rawConsent ?? originalConsentInFlight;
+      if (originalConsentInFlight === abandonedConsent) originalConsentInFlight = null;
+      const githubStatus = state.githubStatus;
       if (abandonedConsent) {
         update({
           ...INITIAL_STATE,
           query: value,
+          githubStatus,
           rawConsent: abandonedConsent,
           phase: "raw-revoking",
         });
         void beginRevocationBarrier(abandonedConsent);
         return;
       }
-      update({ ...INITIAL_STATE, query: value });
+      update({ ...INITIAL_STATE, query: value, githubStatus });
     },
     async submit() {
       const taskQuery = state.query.trim();
@@ -372,10 +540,12 @@ export function createTaskSearchController(dependencies: TaskSearchDependencies)
         }
       }
       const { controller, version } = startRequest();
+      const currentGitHubStatus = state.githubStatus;
       update({
         ...INITIAL_STATE,
         query: state.query,
         submittedQuery: taskQuery,
+        githubStatus: currentGitHubStatus,
         phase: "local-searching",
       });
       try {
@@ -385,10 +555,41 @@ export function createTaskSearchController(dependencies: TaskSearchDependencies)
           revokeConsentBestEffort(responseConsent);
           return true;
         }
-        update({ results: response.results });
-        if (response.results.length > 0) {
+        if (response.localMatchLevel === "strong") {
           revokeConsentBestEffort(responseConsent);
-          update({ phase: "complete" });
+          update({
+            localMatchLevel: response.localMatchLevel,
+            results: response.results,
+            phase: "complete",
+          });
+          return true;
+        }
+        const githubStatus = response.githubStatus
+          ? replaceGitHubStatus(response.githubStatus)
+          : null;
+        update({
+          localMatchLevel: response.localMatchLevel,
+          results: response.results,
+          githubSearch: response.githubSearch,
+        });
+        if (!githubStatus) {
+          revokeConsentBestEffort(responseConsent);
+          update({
+            githubStage: "repository-search",
+            phase: "sanitized-error",
+            error: { stage: "sanitized", code: "github-response-invalid", retryAt: null },
+          });
+        } else if (githubStatus.state !== "ready") {
+          revokeConsentBestEffort(responseConsent);
+          update({
+            githubResults: null,
+            githubIncomplete: false,
+            githubDiagnostics: null,
+            githubStage: "repository-search",
+            rawConsent: null,
+            phase: "sanitized-error",
+            error: unavailableStatusError(githubStatus),
+          });
         } else if (response.githubSearch) {
           revokeConsentBestEffort(responseConsent);
           await runSanitizedSearch(taskQuery, response.githubSearch, version, controller.signal);
@@ -424,6 +625,23 @@ export function createTaskSearchController(dependencies: TaskSearchDependencies)
       const preview = state.githubSearch;
       const { controller, version } = startRequest();
       try {
+        const refreshed = await refreshGitHubStatus();
+        if (!isCurrent(version)) return true;
+        const githubStatus = state.githubStatus;
+        if (!refreshed || !githubStatus || githubStatus.state !== "ready") {
+          update({
+            githubResults: state.githubResults,
+            githubIncomplete: state.githubIncomplete,
+            githubDiagnostics: state.githubDiagnostics,
+            githubStage: "repository-search",
+            rawConsent: null,
+            phase: "sanitized-error",
+            error: githubStatus && githubStatus.state !== "ready"
+              ? unavailableStatusError(githubStatus)
+              : { stage: "sanitized", code: "github-network-failed", retryAt: null },
+          });
+          return true;
+        }
         await runSanitizedSearch(query, preview, version, controller.signal);
       } finally {
         finishRequest(version);
@@ -439,26 +657,43 @@ export function createTaskSearchController(dependencies: TaskSearchDependencies)
         !state.submittedQuery
       ) return false;
       const query = state.submittedQuery;
-      const token = state.rawConsent.token;
+      const originalConsent = state.rawConsent;
+      originalConsentInFlight = originalConsent;
       const { controller, version } = startRequest();
       update({
         githubResults: null,
         githubIncomplete: false,
+        githubDiagnostics: null,
+        githubStage: "repository-search",
         rawConsent: null,
         phase: "raw-searching",
         originalOutcome: "none",
         error: null,
       });
       try {
-        const response = await dependencies.searchOriginalGitHubSkills(query, token, controller.signal);
-        if (!isCurrent(version)) return true;
+        const response = await dependencies.searchOriginalGitHubSkills(
+          query,
+          originalConsent.token,
+          controller.signal,
+        );
+        if (!isCurrent(version)) {
+          await revokeUncertainOriginalConsent(originalConsent);
+          return true;
+        }
         const githubResults = response.results.slice(0, 3);
+        const githubDiagnostics = materializeGitHubDiagnostics(response.diagnostics);
+        const githubIncomplete = response.incomplete ||
+          githubDiagnostics.incomplete ||
+          githubDiagnostics.stageReached !== "complete";
+        originalConsentInFlight = null;
         update({
           githubResults,
-          githubIncomplete: response.incomplete,
+          githubIncomplete,
+          githubDiagnostics,
+          githubStage: githubDiagnostics.stageReached,
           rawConsent: null,
           phase: "complete",
-          originalOutcome: response.incomplete
+          originalOutcome: githubIncomplete
             ? "incomplete"
             : githubResults.length === 0
               ? "empty"
@@ -466,15 +701,31 @@ export function createTaskSearchController(dependencies: TaskSearchDependencies)
           error: null,
         });
       } catch (error) {
-        if (!isCurrent(version) || (isAbortError(error) && controller.signal.aborted)) return true;
-        update({
-          githubResults: null,
-          githubIncomplete: false,
-          rawConsent: null,
-          phase: "raw-error",
-          originalOutcome: "none",
-          error: normalizeError(error, "original"),
-        });
+        const normalized = normalizeGitHubError(error, "original");
+        const cleanup = await revokeUncertainOriginalConsent(originalConsent);
+        if (cleanup.owned && isCurrent(version)) {
+          update(cleanup.revoked
+            ? {
+                githubResults: null,
+                githubIncomplete: false,
+                githubDiagnostics: null,
+                githubStage: normalized.githubStage,
+                rawConsent: null,
+                phase: "raw-error",
+                originalOutcome: "none",
+                error: normalized.error,
+              }
+            : {
+                githubResults: null,
+                githubIncomplete: false,
+                githubDiagnostics: null,
+                githubStage: normalized.githubStage,
+                rawConsent: originalConsent,
+                phase: "raw-revoke-error",
+                originalOutcome: "none",
+                error: { stage: "revoke", code: "raw-revoke-error", retryAt: null },
+              });
+        }
       } finally {
         finishRequest(version);
       }
@@ -497,13 +748,18 @@ export function createTaskSearchController(dependencies: TaskSearchDependencies)
     },
     dispose() {
       if (disposed) return;
-      const abandonedConsent = state.rawConsent;
+      const abandonedConsent = state.rawConsent ?? originalConsentInFlight;
+      if (originalConsentInFlight === abandonedConsent) originalConsentInFlight = null;
       state = { ...state, submittedQuery: "", rawConsent: null, error: null };
       disposed = true;
       requestVersion += 1;
       requestInFlight = false;
       activeRequest?.abort();
       activeRequest = null;
+      statusVersion += 1;
+      activeStatusRequest?.abort();
+      activeStatusRequest = null;
+      statusRequestInFlight = null;
       listeners.clear();
       revokeConsentBestEffort(abandonedConsent);
     },

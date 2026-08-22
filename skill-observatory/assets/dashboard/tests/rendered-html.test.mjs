@@ -27,8 +27,14 @@ test("server-renders the Skill Observatory shell", async () => {
     assert.match(html, new RegExp(label));
   }
   assert.match(html, /最多 3 个/);
+  assert.match(html, /搜索诊断/);
+  assert.match(html, /复制测试记录/);
+  assert.match(html, /尚未搜索/);
+  assert.doesNotMatch(html, /无缓存记录<!-- --> ·<!-- -->结果完整/);
   assert.match(html, /隐式匹配不是百分之百保证/);
   assert.doesNotMatch(html, /在 GitHub 查找/);
   assert.doesNotMatch(html, /自动安装|立即安装/);
+  assert.doesNotMatch(html, /GITHUB_TOKEN|consentToken|taskDigest|submittedQuery|PRIVATE_(?:QUERY|TOKEN|PATH|BODY|STACK)_SENTINEL/);
+  assert.doesNotMatch(html, /<pre[^>]*data-diagnostic-record/i);
   assert.doesNotMatch(html, /codex-preview|SkeletonPreview|react-loading-skeleton/i);
 });

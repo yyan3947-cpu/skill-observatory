@@ -11,6 +11,11 @@ import {
 
 const fixturesDirectory = join(import.meta.dirname, "fixtures");
 
+test("pins the patched YAML parser used for untrusted GitHub frontmatter", async () => {
+  const manifest = JSON.parse(await readFile(join(import.meta.dirname, "..", "package.json"), "utf8"));
+  assert.equal(manifest.dependencies["js-yaml"], "4.3.1");
+});
+
 async function fixture(name) {
   return readFile(join(fixturesDirectory, name), "utf8");
 }
@@ -18,12 +23,36 @@ async function fixture(name) {
 async function createRouter() {
   const best = JSON.parse(await fixture("github-search-best.json"));
   const stars = JSON.parse(await fixture("github-search-stars.json"));
-  const tree = JSON.parse(await fixture("github-tree.json"));
   const valid = await fixture("github-skill-valid.md");
-  const invalid = await fixture("github-skill-invalid.md");
   const calls = [];
   let activeTrees = 0;
   let maximumActiveTrees = 0;
+  const dataSkills = new Map([
+    ["owner/data-quality", {
+      name: "data-quality",
+      description: "Data validation and testing skill for data quality checks.",
+    }],
+    ["owner/csv-auditor", {
+      name: "csv-data-validation",
+      description: "Data validation and testing skill for structured CSV records.",
+    }],
+    ["owner/schema-check", {
+      name: "schema-data-testing",
+      description: "Data testing and validation skill for structured schemas.",
+    }],
+    ["owner/data-quality-copy", {
+      name: "data-quality",
+      description: "Data validation and testing skill for duplicate quality checks.",
+    }],
+    ["owner/constraint-skill", {
+      name: "skill",
+      description: "Format local gardening notes.",
+    }],
+    ["owner/alias-only-validation", {
+      name: "data-validation",
+      description: "Format local gardening notes.",
+    }],
+  ]);
 
   return {
     calls,
@@ -35,7 +64,35 @@ async function createRouter() {
       calls.push(parsed.toString());
       const headers = { "x-ratelimit-remaining": String(60 - calls.length), "x-ratelimit-reset": "1780000000" };
       if (parsed.pathname === "/search/repositories") {
+        const query = parsed.searchParams.get("q") ?? "";
+        if (query.includes('"data validation" testing skill')) {
+          return Response.json({
+            items: [
+              repositoryItem("constraint-skill", 99999),
+              repositoryItem("alias-only-validation", 99998),
+              repositoryItem("data-quality", 12000),
+              repositoryItem("unrelated-tool", 50000),
+            ],
+            incomplete_results: false,
+          }, { headers });
+        }
+        if (query.includes('"data validation" skill')) {
+          return Response.json({
+            items: [repositoryItem("csv-auditor", 8000), repositoryItem("data-quality-copy", 2000)],
+            incomplete_results: false,
+          }, { headers });
+        }
+        if (query.includes('"data testing" skill')) {
+          return Response.json({
+            items: [repositoryItem("schema-check", 3500)],
+            incomplete_results: false,
+          }, { headers });
+        }
         return Response.json(parsed.searchParams.get("sort") === "stars" ? stars : best, { headers });
+      }
+
+      if (parsed.pathname === "/search/code") {
+        return Response.json({ items: [], incomplete_results: false }, { headers });
       }
 
       const treeMatch = parsed.pathname.match(/^\/repos\/([^/]+)\/([^/]+)\/git\/trees\//u);
@@ -45,7 +102,19 @@ async function createRouter() {
         await new Promise((resolve) => setImmediate(resolve));
         activeTrees -= 1;
         const repository = `${treeMatch[1]}/${treeMatch[2]}`;
-        if (repository === "owner/news-skill") return Response.json(tree, { headers });
+        if (repository === "owner/news-skill") {
+          return Response.json({
+            tree: [{ path: "news-skill/SKILL.md", type: "blob", size: Buffer.byteLength(valid) }],
+            truncated: false,
+          }, { headers });
+        }
+        if (dataSkills.has(repository)) {
+          const name = dataSkills.get(repository).name;
+          return Response.json({
+            tree: [{ path: `${name}/SKILL.md`, type: "blob", size: 180 }],
+            truncated: false,
+          }, { headers });
+        }
         const name = repository.split("/")[1];
         return Response.json({
           tree: [{ path: `${name}/SKILL.md`, type: "blob", size: 180 }],
@@ -56,7 +125,22 @@ async function createRouter() {
       const contentMatch = parsed.pathname.match(/^\/repos\/([^/]+)\/([^/]+)\/contents\/(.+)$/u);
       if (contentMatch) {
         const repository = `${contentMatch[1]}/${contentMatch[2]}`;
-        let text = invalid;
+        let text = valid
+          .replaceAll("news-skill", repository.split("/")[1])
+          .replace(
+            "Research current affairs and analyze international news from public sources.",
+            "Format local gardening notes.",
+          );
+        if (dataSkills.has(repository)) {
+          const definition = dataSkills.get(repository);
+          text = [
+            "---",
+            `name: ${definition.name}`,
+            `description: ${definition.description}`,
+            "---",
+            "",
+          ].join("\n");
+        }
         if (repository === "owner/news-skill") text = valid;
         if (repository === "owner/research-skill") {
           text = valid
@@ -95,6 +179,7 @@ function repositoryItem(name = "news-skill", stars = 10) {
 function createSingleSkillRouter(skillText, {
   failAt = "",
   ordinary404 = false,
+  repositoryStars = 10,
   skillName = "news-skill",
 } = {}) {
   const calls = [];
@@ -105,16 +190,30 @@ function createSingleSkillRouter(skillText, {
       calls.push(parsed.toString());
       const headers = { "x-ratelimit-remaining": "9", "x-ratelimit-reset": "1780000000" };
       const isSearch = parsed.pathname === "/search/repositories";
+      const isCodeSearch = parsed.pathname === "/search/code";
       const isTree = parsed.pathname.includes("/git/trees/");
       const isContent = parsed.pathname.includes("/contents/");
-      if (failAt === "search" && isSearch) return new Response("limit-body-secret", { status: 403, headers });
+      if (failAt === "search" && isSearch) {
+        return new Response("limit-body-secret", {
+          status: 403,
+          headers: { ...headers, "x-ratelimit-remaining": "0" },
+        });
+      }
       if (failAt === "tree" && isTree) return new Response("limit-body-secret", { status: 429, headers });
-      if (failAt === "content" && isContent) return new Response("limit-body-secret", { status: 403, headers });
+      if (failAt === "content" && isContent) {
+        return new Response("limit-body-secret", {
+          status: 403,
+          headers: { ...headers, "x-ratelimit-remaining": "0" },
+        });
+      }
       if (failAt === "tree-network" && isTree) throw new Error("offline");
       if (failAt === "content-network" && isContent) throw new Error("offline");
       if (ordinary404 && isContent) return new Response("not-found-secret", { status: 404, headers });
       if (isSearch) {
-        return Response.json({ items: [repositoryItem()], incomplete_results: false }, { headers });
+        return Response.json({ items: [repositoryItem("news-skill", repositoryStars)], incomplete_results: false }, { headers });
+      }
+      if (isCodeSearch) {
+        return Response.json({ items: [], incomplete_results: false }, { headers });
       }
       if (isTree) {
         return Response.json({
@@ -135,6 +234,15 @@ function createSingleSkillRouter(skillText, {
       return new Response(null, { status: 404, headers });
     },
   };
+}
+
+function originalSearchOptions(query, fetchImpl) {
+  const options = Object.create(null);
+  Object.defineProperties(options, {
+    query: { value: query, enumerable: true },
+    fetchImpl: { value: fetchImpl, enumerable: true },
+  });
+  return options;
 }
 
 test("validates candidates, removes duplicates, and orders qualified Skills by repository Stars", async () => {
@@ -162,12 +270,47 @@ test("validates candidates, removes duplicates, and orders qualified Skills by r
   assert.deepEqual(result.preview.terms, ["current affairs", "news", "research"]);
 });
 
+test("uses safe variants then returns three distinct relevant names by Stars", async () => {
+  const root = await mkdtemp(join(tmpdir(), "skill-observatory-github-v2-"));
+  const router = await createRouter();
+  const result = await findGitHubSkillSuggestions({
+    query: "检测 Acme 客户数据质量",
+    cachePath: join(root, "state", "github-suggestions-cache.json"),
+    fetchImpl: router.fetchImpl,
+    now: new Date("2026-08-17T00:00:00Z"),
+  });
+
+  const searches = router.calls.filter((url) => new URL(url).pathname === "/search/repositories");
+  assert.equal(searches.length, 3);
+  assert.ok(searches.every((url) => !/Acme|客户|质量/u.test(new URL(url).searchParams.get("q"))));
+  assert.deepEqual(result.results.map((item) => item.stars), [12000, 8000, 3500]);
+  assert.deepEqual(
+    result.results.map((item) => item.name),
+    ["data-quality", "csv-data-validation", "schema-data-testing"],
+  );
+  assert.equal(new Set(result.results.map((item) => item.name)).size, 3);
+  assert.equal(result.results.some((item) => item.name === "skill"), false);
+  assert.equal(result.results.some((item) => item.name === "data-validation"), false);
+  assert.equal(result.results.some((item) => item.stars === 50000), false);
+});
+
+test("does not pad fewer than three qualified candidates", async () => {
+  const root = await mkdtemp(join(tmpdir(), "skill-observatory-github-v2-short-"));
+  const router = createSingleSkillRouter(await fixture("github-skill-valid.md"));
+  const result = await findGitHubSkillSuggestions({
+    query: "搜寻国际时事",
+    cachePath: join(root, "state", "github-suggestions-cache.json"),
+    fetchImpl: router.fetchImpl,
+  });
+  assert.equal(result.results.length, 1);
+});
+
 test("searches the exact original task through the validated pipeline without cache I/O", async () => {
   const root = await mkdtemp(join(tmpdir(), "skill-observatory-original-search-"));
   const cachePath = join(root, "must-remain-unchanged.json");
   await writeFile(cachePath, "cache-sentinel\n", "utf8");
   const router = await createRouter();
-  const query = "Research current affairs";
+  const query = "Research current affairs news";
   const result = await findGitHubSkillSuggestionsFromOriginalQuery({
     query,
     fetchImpl: router.fetchImpl,
@@ -183,6 +326,26 @@ test("searches the exact original task through the validated pipeline without ca
   assert.deepEqual(result.results.map((item) => item.repository), ["owner/news-skill", "owner/research-skill"]);
   assert.deepEqual(result.results.map((item) => item.stars), [900, 100]);
   assert.equal(await readFile(cachePath, "utf8"), "cache-sentinel\n");
+});
+
+test("does not infer remote intent tags from a high-Star biography description", async () => {
+  const skillText = [
+    "---",
+    "name: biography-tool",
+    "description: Research biographies from public sources.",
+    "---",
+    "",
+  ].join("\n");
+  const router = createSingleSkillRouter(skillText, {
+    repositoryStars: 500_000,
+    skillName: "biography-tool",
+  });
+
+  const result = await findGitHubSkillSuggestionsFromOriginalQuery(
+    originalSearchOptions("Research current affairs", router.fetchImpl),
+  );
+
+  assert.deepEqual(result.results, []);
 });
 
 test("rejects an original-search cache path without reading it or invoking the network", async () => {
@@ -336,7 +499,7 @@ test("accepts null-prototype original-search options", async () => {
   const router = await createRouter();
   const options = Object.create(null);
   Object.defineProperties(options, {
-    query: { value: "Research current affairs", enumerable: true },
+    query: { value: "Research current affairs news", enumerable: true },
     fetchImpl: { value: router.fetchImpl, enumerable: true },
     token: { value: "test-token", enumerable: true },
   });
@@ -462,12 +625,14 @@ test("cache omits the original task, token, and Skill text, then expires after 2
     now: firstNow,
   });
   assert.equal(first.cached, false);
+  assert.equal(first.diagnostics.cached, false);
 
   const cacheText = await readFile(cachePath, "utf8");
   assert.doesNotMatch(cacheText, /原始秘密任务|test-token|Read and summarize sources/);
   assert.match(cacheText, /current affairs/);
   assert.equal((await stat(cachePath)).mode & 0o777, 0o600);
   assert.equal((await stat(join(root, "state"))).mode & 0o777, 0o700);
+  assert.equal(JSON.parse(cacheText).version, 4);
 
   let cachedNetworkCalls = 0;
   const cached = await findGitHubSkillSuggestions({
@@ -481,6 +646,7 @@ test("cache omits the original task, token, and Skill text, then expires after 2
     now: new Date(firstNow.getTime() + 23 * 60 * 60 * 1000),
   });
   assert.equal(cached.cached, true);
+  assert.equal(cached.diagnostics.cached, true);
   assert.equal(cachedNetworkCalls, 0);
 
   const expiredRouter = await createRouter();
@@ -495,6 +661,48 @@ test("cache omits the original task, token, and Skill text, then expires after 2
   assert.equal(expiredRouter.calls.length > 0, true);
 });
 
+test("invalidates v3 repository-only cache entries created before hybrid discovery", async () => {
+  const root = await mkdtemp(join(tmpdir(), "skill-observatory-v2-relevance-cache-"));
+  const cachePath = join(root, "state", "github-suggestions-cache.json");
+  const initialRouter = await createRouter();
+  await findGitHubSkillSuggestions({
+    query: "检测数据",
+    cachePath,
+    fetchImpl: initialRouter.fetchImpl,
+    now: new Date("2026-08-17T00:00:00Z"),
+  });
+
+  const legacyCache = JSON.parse(await readFile(cachePath, "utf8"));
+  legacyCache.version = 3;
+  const [cacheKey] = Object.keys(legacyCache.entries);
+  legacyCache.entries[cacheKey].results = [{
+    repository: "owner/alias-only-validation",
+    repositoryUrl: "https://github.com/owner/alias-only-validation",
+    skillDirectory: "data-validation",
+    name: "data-validation",
+    summary: "Format local gardening notes.",
+    reasonZh: "任务与它的典型触发场景一致",
+    stars: 99998,
+    pushedAt: "2026-08-10T10:00:00Z",
+    license: "MIT",
+  }];
+  await writeFile(cachePath, `${JSON.stringify(legacyCache)}\n`, { encoding: "utf8", mode: 0o600 });
+  await chmod(cachePath, 0o600);
+
+  const retryRouter = await createRouter();
+  const result = await findGitHubSkillSuggestions({
+    query: "检测数据",
+    cachePath,
+    fetchImpl: retryRouter.fetchImpl,
+    now: new Date("2026-08-17T01:00:00Z"),
+  });
+
+  assert.equal(result.cached, false);
+  assert.equal(retryRouter.calls.length > 0, true);
+  assert.equal(result.results.some((item) => item.name === "data-validation"), false);
+  assert.equal(JSON.parse(await readFile(cachePath, "utf8")).version, 4);
+});
+
 test("returns an empty, network-free response when no controlled preview exists", async () => {
   let calls = 0;
   const result = await findGitHubSkillSuggestions({
@@ -506,7 +714,25 @@ test("returns an empty, network-free response when no controlled preview exists"
     },
   });
 
-  assert.deepEqual(result, { preview: null, results: [], cached: false, incomplete: false, rateLimit: null });
+  assert.deepEqual(result, {
+    preview: null,
+    results: [],
+    cached: false,
+    incomplete: false,
+    rateLimit: null,
+    diagnostics: {
+      stageReached: "complete",
+      repositoryHits: 0,
+      codeHits: 0,
+      validatedCandidates: 0,
+      rejectedCandidates: 0,
+      deduplicatedCandidates: 0,
+      rejectionCounts: [],
+      cached: false,
+      incomplete: false,
+      rateLimits: { search: null, codeSearch: null },
+    },
+  });
   assert.equal(calls, 0);
 });
 
@@ -533,35 +759,95 @@ for (const stage of ["search", "tree", "content"]) {
   });
 }
 
-for (const stage of ["tree-network", "content-network"]) {
-  test(`does not cache an empty result when every ${stage} validation fails`, async () => {
-    const root = await mkdtemp(join(tmpdir(), `skill-observatory-network-${stage}-`));
+for (const failure of [
+  { status: 401, code: "github-token-invalid" },
+  { status: 403, code: "github-access-denied" },
+]) {
+  test(`stops after the first ${failure.status} search response without reading or caching`, async () => {
+    const root = await mkdtemp(join(tmpdir(), `skill-observatory-fatal-${failure.status}-`));
     const cachePath = join(root, "state", "github-suggestions-cache.json");
-    const valid = await fixture("github-skill-valid.md");
-    const router = createSingleSkillRouter(valid, { failAt: stage });
+    let bodyReads = 0;
+    let requestCount = 0;
+
     await assert.rejects(
       () => findGitHubSkillSuggestions({
         query: "国际时事",
         cachePath,
-        fetchImpl: router.fetchImpl,
+        fetchImpl: async () => {
+          requestCount += 1;
+          return {
+            status: failure.status,
+            ok: false,
+            headers: new Headers({ "x-ratelimit-remaining": "9" }),
+            async json() {
+              bodyReads += 1;
+              return { message: "remote-body-secret" };
+            },
+          };
+        },
       }),
-      (error) => error.code === "github-network-failed",
+      (error) => error.code === failure.code && error.status === failure.status,
     );
+    assert.equal(requestCount, 1);
+    assert.equal(bodyReads, 0);
     await assert.rejects(readFile(cachePath, "utf8"), (error) => error.code === "ENOENT");
   });
 }
 
-test("does not cache when every candidate content request fails without a successful validation", async () => {
+for (const stage of ["tree-network", "content-network"]) {
+  test(`continues to one code fallback and does not cache when every ${stage} validation fails`, async () => {
+    const root = await mkdtemp(join(tmpdir(), `skill-observatory-network-${stage}-`));
+    const cachePath = join(root, "state", "github-suggestions-cache.json");
+    const valid = await fixture("github-skill-valid.md");
+    const router = createSingleSkillRouter(valid, { failAt: stage });
+    const result = await findGitHubSkillSuggestions({
+      query: "国际时事",
+      cachePath,
+      fetchImpl: router.fetchImpl,
+    });
+    assert.equal(result.incomplete, true);
+    assert.deepEqual(result.results, []);
+    assert.equal(result.diagnostics.rejectionCounts.some((item) => (
+      item.reason === "unavailable" && item.count >= 1
+    )), true);
+    assert.equal(router.calls.filter((url) => new URL(url).pathname === "/search/code").length, 1);
+    await assert.rejects(readFile(cachePath, "utf8"), (error) => error.code === "ENOENT");
+  });
+}
+
+test("continues to one code fallback when every candidate content request returns 404", async () => {
   const root = await mkdtemp(join(tmpdir(), "skill-observatory-content-404-"));
   const cachePath = join(root, "state", "github-suggestions-cache.json");
   const valid = await fixture("github-skill-valid.md");
   const router = createSingleSkillRouter(valid, { ordinary404: true });
-  await assert.rejects(
-    () => findGitHubSkillSuggestions({ query: "国际时事", cachePath, fetchImpl: router.fetchImpl }),
-    (error) => error.code === "github-request-failed",
-  );
+  const result = await findGitHubSkillSuggestions({
+    query: "国际时事",
+    cachePath,
+    fetchImpl: router.fetchImpl,
+  });
+  assert.equal(result.incomplete, true);
+  assert.deepEqual(result.results, []);
+  assert.equal(router.calls.filter((url) => new URL(url).pathname === "/search/code").length, 1);
   await assert.rejects(readFile(cachePath, "utf8"), (error) => error.code === "ENOENT");
 });
+
+for (const failure of [
+  { label: "tree network", options: { failAt: "tree-network" }, code: "github-network-failed" },
+  { label: "content 404", options: { ordinary404: true }, code: "github-request-failed" },
+]) {
+  test(`original-query repository-only search retains safe ${failure.label} failure semantics`, async () => {
+    const valid = await fixture("github-skill-valid.md");
+    const router = createSingleSkillRouter(valid, failure.options);
+    await assert.rejects(
+      () => findGitHubSkillSuggestionsFromOriginalQuery(
+        originalSearchOptions("Research current affairs", router.fetchImpl),
+      ),
+      (error) => error.code === failure.code &&
+        !String(error.stack).includes("not-found-secret"),
+    );
+    assert.equal(router.calls.some((url) => new URL(url).pathname === "/search/code"), false);
+  });
+}
 
 test("retries an incomplete discovery, caches only the complete retry, and then serves it", async () => {
   const root = await mkdtemp(join(tmpdir(), "skill-observatory-partial-404-"));
@@ -782,7 +1068,7 @@ test("accepts YAML 1.1 scalar forms the official loader keeps as strings", async
     '"="',
     "!!str =",
   ];
-  for (const [index, description] of stringDescriptions.entries()) {
+  for (const description of stringDescriptions) {
     const skillText = [
       "---",
       "name: current-affairs",
@@ -790,13 +1076,10 @@ test("accepts YAML 1.1 scalar forms the official loader keeps as strings", async
       "---",
       "",
     ].join("\n");
-    const root = await mkdtemp(join(tmpdir(), `skill-observatory-yaml-string-scalar-${index}-`));
     const router = createSingleSkillRouter(skillText, { skillName: "current-affairs" });
-    const result = await findGitHubSkillSuggestions({
-      query: "国际时事",
-      cachePath: join(root, "state", "github-suggestions-cache.json"),
-      fetchImpl: router.fetchImpl,
-    });
+    const result = await findGitHubSkillSuggestionsFromOriginalQuery(
+      originalSearchOptions("current-affairs", router.fetchImpl),
+    );
 
     assert.deepEqual(
       result.results.map((item) => item.name),
@@ -820,19 +1103,16 @@ test("accepts the official frontmatter key set at the name and description lengt
     "---",
     "",
   ].join("\n");
-  const root = await mkdtemp(join(tmpdir(), "skill-observatory-yaml-boundary-"));
   const router = createSingleSkillRouter(skillText, { skillName: name });
-  const result = await findGitHubSkillSuggestions({
-    query: "国际时事",
-    cachePath: join(root, "state", "github-suggestions-cache.json"),
-    fetchImpl: router.fetchImpl,
-  });
+  const result = await findGitHubSkillSuggestionsFromOriginalQuery(
+    originalSearchOptions(name, router.fetchImpl),
+  );
 
   assert.deepEqual(result.results.map((item) => item.name), [name]);
 });
 
 test("accepts explicitly quoted strings that YAML would otherwise type as plain scalars", async () => {
-  for (const [index, name] of ["yes", "2020-01-01", "1e3", "0o10"].entries()) {
+  for (const name of ["yes", "2020-01-01", "1e3", "0o10"]) {
     const skillText = [
       "---",
       `name: ${JSON.stringify(name)}`,
@@ -840,13 +1120,10 @@ test("accepts explicitly quoted strings that YAML would otherwise type as plain 
       "---",
       "",
     ].join("\n");
-    const root = await mkdtemp(join(tmpdir(), `skill-observatory-yaml-quoted-${index}-`));
     const router = createSingleSkillRouter(skillText, { skillName: name });
-    const result = await findGitHubSkillSuggestions({
-      query: "国际时事",
-      cachePath: join(root, "state", "github-suggestions-cache.json"),
-      fetchImpl: router.fetchImpl,
-    });
+    const result = await findGitHubSkillSuggestionsFromOriginalQuery(
+      originalSearchOptions(name, router.fetchImpl),
+    );
 
     assert.deepEqual(result.results.map((item) => item.name), [name]);
   }
@@ -863,7 +1140,7 @@ test("coalesces ten simultaneous requests for the same cache key", async () => {
   }));
 
   const responses = await Promise.all(requests);
-  assert.equal(router.calls.filter((url) => new URL(url).pathname === "/search/repositories").length, 2);
+  assert.equal(router.calls.filter((url) => new URL(url).pathname === "/search/repositories").length, 3);
   assert.ok(responses.every((response) => response === responses[0]));
   assert.ok(responses.every((response) => response.cached === false));
 });
@@ -894,6 +1171,47 @@ test("serializes cache merges for different keys and globally limits GitHub requ
   assert.equal(Object.keys(cache.entries).length, 2);
   assert.equal(maximumActive <= 3, true);
   assert.equal((await stat(cachePath)).mode & 0o777, 0o600);
+});
+
+test("cache merge uses completion time when starts are more than two minutes apart", async () => {
+  const root = await mkdtemp(join(tmpdir(), "skill-observatory-cache-start-order-"));
+  const cachePath = join(root, "state", "github-suggestions-cache.json");
+  const router = await createRouter();
+  let clock = Date.parse("2026-08-17T00:00:00.000Z");
+  let clockCalls = 0;
+  const now = () => {
+    clockCalls += 1;
+    return clock;
+  };
+  let releaseEarlier;
+  const earlierGate = new Promise((resolve) => { releaseEarlier = resolve; });
+  const earlierRequest = findGitHubSkillSuggestions({
+    query: "国际时事",
+    cachePath,
+    fetchImpl: async (...args) => {
+      await earlierGate;
+      return router.fetchImpl(...args);
+    },
+    now,
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  clock += 3 * 60 * 1000;
+  try {
+    await findGitHubSkillSuggestions({
+      query: "小红书发布",
+      cachePath,
+      fetchImpl: router.fetchImpl,
+      now,
+    });
+  } finally {
+    clock += 60 * 1000;
+    releaseEarlier();
+  }
+  await earlierRequest;
+
+  const cache = JSON.parse(await readFile(cachePath, "utf8"));
+  assert.equal(Object.keys(cache.entries).length, 2);
+  assert.equal(clockCalls, 4);
 });
 
 test("does not cache timed-out requests or expose token and transport details", async () => {
@@ -951,7 +1269,33 @@ test("treats insecure or structurally tampered fresh caches as misses", async ()
     (cache) => { cache.entries[Object.keys(cache.entries)[0]].results[0].skillDirectory = "skills/not-the-name"; },
     (cache) => { cache.entries[Object.keys(cache.entries)[0]].results.push(cache.entries[Object.keys(cache.entries)[0]].results[0]); },
     (cache) => { cache.entries[Object.keys(cache.entries)[0]].results.reverse(); },
+    (cache) => { cache.entries[Object.keys(cache.entries)[0]].expiresAt = "2026-08-16T02:02:00.001Z"; },
+    (cache) => { cache.entries[Object.keys(cache.entries)[0]].diagnostics.privatePath = "/private/cache-secret"; },
+    (cache) => { cache.entries[Object.keys(cache.entries)[0]].diagnostics.rejectionCounts = [{ reason: "raw-error", count: 1 }]; },
+    (cache) => { cache.entries[Object.keys(cache.entries)[0]].diagnostics.incomplete = true; },
+    (cache) => { cache.entries[Object.keys(cache.entries)[0]].diagnostics.validatedCandidates = 0; },
   ];
+  const invalidRetryAtValues = [
+    "May 1 2026",
+    "2026-05-01T00:00:00+00:00",
+    "2026-05-01T00:00:00Z",
+    "2026-05-01T00:00:00.0Z",
+    "2026-05-01T00:00:00.0000Z",
+    "+275760-09-13T00:00:00.001Z",
+  ];
+  const retryAtTargets = [
+    (entry) => entry.rateLimit,
+    (entry) => entry.diagnostics.rateLimits.search,
+    (entry) => entry.diagnostics.rateLimits.codeSearch,
+  ];
+  for (const retryAt of invalidRetryAtValues) {
+    for (const target of retryAtTargets) {
+      scenarios.push((cache) => {
+        const entry = cache.entries[Object.keys(cache.entries)[0]];
+        target(entry).retryAt = retryAt;
+      });
+    }
+  }
   for (const mutate of scenarios) {
     const cache = JSON.parse(await readFile(cachePath, "utf8"));
     mutate(cache);
@@ -966,5 +1310,16 @@ test("treats insecure or structurally tampered fresh caches as misses", async ()
     });
     assert.equal(response.cached, false);
     assert.equal(router.calls.length > 0, true);
+    const rewrittenCache = JSON.parse(await readFile(cachePath, "utf8"));
+    const rewrittenEntry = rewrittenCache.entries[Object.keys(rewrittenCache.entries)[0]];
+    for (const rateLimit of [
+      rewrittenEntry.rateLimit,
+      rewrittenEntry.diagnostics.rateLimits.search,
+      rewrittenEntry.diagnostics.rateLimits.codeSearch,
+    ]) {
+      if (rateLimit?.retryAt !== null) {
+        assert.equal(new Date(rateLimit.retryAt).toISOString(), rateLimit.retryAt);
+      }
+    }
   }
 });

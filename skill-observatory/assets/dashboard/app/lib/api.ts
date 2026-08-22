@@ -1,6 +1,12 @@
 import type {
   Catalog,
+  GitHubRateLimit,
+  GitHubRateLimits,
+  GitHubRejectionReason,
   GitHubSearchPreview,
+  GitHubSearchDiagnostics,
+  GitHubSearchStage,
+  GitHubServiceStatus,
   GitHubSkillSuggestion,
   GitHubSuggestionResponse,
   RawSearchConsent,
@@ -18,6 +24,9 @@ const BROWSER_API_ERROR_CODES = [
   "local-query-too-long",
   "local-service-unavailable",
   "local-response-invalid",
+  "github-token-missing",
+  "github-token-invalid",
+  "github-access-denied",
   "github-rate-limited",
   "github-query-rejected",
   "github-request-timeout",
@@ -36,11 +45,36 @@ export type BrowserApiErrorCode = typeof BROWSER_API_ERROR_CODES[number];
 export interface BrowserApiErrorDetails {
   code: BrowserApiErrorCode;
   retryAt: string | null;
+  stage: GitHubSearchStage | null;
 }
 
 const ERROR_CODE_SET = new Set<string>(BROWSER_API_ERROR_CODES);
+const GITHUB_SERVICE_STATES = new Set([
+  "ready",
+  "missing-token",
+  "invalid-token",
+  "rate-limited",
+  "github-unavailable",
+]);
+const GITHUB_SEARCH_STAGES = new Set<GitHubSearchStage>([
+  "repository-search",
+  "code-search",
+  "candidate-validation",
+  "complete",
+]);
+const GITHUB_REJECTION_REASONS: readonly GitHubRejectionReason[] = [
+  "invalid-structure",
+  "invalid-content",
+  "irrelevant",
+  "duplicate",
+  "unavailable",
+];
 
-function browserApiError(code: BrowserApiErrorCode, retryAt: string | null = null) {
+function browserApiError(
+  code: BrowserApiErrorCode,
+  retryAt: string | null = null,
+  stage: GitHubSearchStage | null = null,
+) {
   const error = new Error(code);
   Object.defineProperty(error, "code", {
     value: code,
@@ -50,6 +84,12 @@ function browserApiError(code: BrowserApiErrorCode, retryAt: string | null = nul
   });
   Object.defineProperty(error, "retryAt", {
     value: retryAt,
+    enumerable: true,
+    configurable: true,
+    writable: false,
+  });
+  Object.defineProperty(error, "stage", {
+    value: stage,
     enumerable: true,
     configurable: true,
     writable: false,
@@ -67,16 +107,23 @@ export function readBrowserApiError(value: unknown): BrowserApiErrorDetails | nu
     const descriptors = Object.getOwnPropertyDescriptors(value);
     const codeDescriptor = Object.hasOwn(descriptors, "code") ? descriptors.code : null;
     const retryDescriptor = Object.hasOwn(descriptors, "retryAt") ? descriptors.retryAt : null;
+    const stageDescriptor = Object.hasOwn(descriptors, "stage") ? descriptors.stage : null;
     const code = codeDescriptor && Object.hasOwn(codeDescriptor, "value")
       ? codeDescriptor.value
       : undefined;
     const retryAt = retryDescriptor && Object.hasOwn(retryDescriptor, "value")
       ? retryDescriptor.value
       : null;
+    const stage = stageDescriptor && Object.hasOwn(stageDescriptor, "value")
+      ? stageDescriptor.value
+      : null;
     if (typeof code !== "string" || !ERROR_CODE_SET.has(code)) return null;
     return {
       code: code as BrowserApiErrorCode,
-      retryAt: typeof retryAt === "string" && Number.isFinite(Date.parse(retryAt)) ? retryAt : null,
+      retryAt: isCanonicalIsoTimestamp(retryAt) ? retryAt : null,
+      stage: typeof stage === "string" && GITHUB_SEARCH_STAGES.has(stage as GitHubSearchStage)
+        ? stage as GitHubSearchStage
+        : null,
     };
   } catch {
     return null;
@@ -90,9 +137,30 @@ function descriptors(value: unknown) {
   return Object.getOwnPropertyDescriptors(value);
 }
 
+function exactDataDescriptors(value: unknown, fields: readonly string[]) {
+  const record = descriptors(value);
+  if (!record) return null;
+  const keys = Reflect.ownKeys(record);
+  if (
+    keys.length !== fields.length ||
+    keys.some((key) => typeof key !== "string" || !fields.includes(key))
+  ) return null;
+  if (fields.some((field) => {
+    const descriptor = record[field];
+    return !descriptor.enumerable || !Object.hasOwn(descriptor, "value");
+  })) return null;
+  return record;
+}
+
 function ownValue(record: PropertyDescriptorMap, key: string) {
   const descriptor = Object.hasOwn(record, key) ? record[key] : null;
   return descriptor && Object.hasOwn(descriptor, "value") ? descriptor.value : MISSING;
+}
+
+function isCanonicalIsoTimestamp(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const milliseconds = Date.parse(value);
+  return Number.isFinite(milliseconds) && new Date(milliseconds).toISOString() === value;
 }
 
 function cloneStringArray(value: unknown, maximum = 256) {
@@ -104,7 +172,7 @@ function cloneStringArray(value: unknown, maximum = 256) {
 
 function clonePreview(value: unknown): GitHubSearchPreview | null | typeof MISSING {
   if (value === null) return null;
-  const record = descriptors(value);
+  const record = exactDataDescriptors(value, ["terms", "label"]);
   if (!record) return MISSING;
   const terms = cloneStringArray(ownValue(record, "terms"), 6);
   const label = ownValue(record, "label");
@@ -114,22 +182,63 @@ function clonePreview(value: unknown): GitHubSearchPreview | null | typeof MISSI
 
 function cloneConsent(value: unknown): RawSearchConsent | null | typeof MISSING {
   if (value === null) return null;
-  const record = descriptors(value);
+  const record = exactDataDescriptors(value, ["token", "expiresAt"]);
   if (!record) return MISSING;
   const token = ownValue(record, "token");
   const expiresAt = ownValue(record, "expiresAt");
   if (
     !isValidConsentToken(token) ||
-    typeof expiresAt !== "string" ||
-    !Number.isFinite(Date.parse(expiresAt))
+    !isCanonicalIsoTimestamp(expiresAt)
   ) {
     return MISSING;
   }
   return { token, expiresAt };
 }
 
+function cloneGitHubRateLimits(value: unknown): GitHubRateLimits | typeof MISSING {
+  const record = exactDataDescriptors(value, ["search", "codeSearch"]);
+  if (!record) return MISSING;
+  const search = cloneRateLimit(ownValue(record, "search"));
+  const codeSearch = cloneRateLimit(ownValue(record, "codeSearch"));
+  if (search === MISSING || codeSearch === MISSING) return MISSING;
+  return { search, codeSearch };
+}
+
+function cloneGitHubStatus(value: unknown): GitHubServiceStatus | null {
+  const safe = cloneUnproxiedJsonValue(value);
+  const record = safe === MISSING
+    ? null
+    : exactDataDescriptors(safe, ["state", "checkedAt", "rateLimits"]);
+  if (!record) return null;
+  const state = ownValue(record, "state");
+  const checkedAt = ownValue(record, "checkedAt");
+  const rateLimits = cloneGitHubRateLimits(ownValue(record, "rateLimits"));
+  if (
+    typeof state !== "string" ||
+    !GITHUB_SERVICE_STATES.has(state) ||
+    !isCanonicalIsoTimestamp(checkedAt) ||
+    rateLimits === MISSING ||
+    (["missing-token", "invalid-token", "github-unavailable"].includes(state) &&
+      (rateLimits.search !== null || rateLimits.codeSearch !== null)) ||
+    (state === "ready" && rateLimits.search?.remaining === 0)
+  ) return null;
+  return {
+    state: state as GitHubServiceStatus["state"],
+    checkedAt,
+    rateLimits,
+  };
+}
+
 function cloneRecommendation(value: unknown): Recommendation | null {
-  const record = descriptors(value);
+  const record = exactDataDescriptors(value, [
+    "skillId",
+    "name",
+    "summaryZh",
+    "status",
+    "score",
+    "reasonCodes",
+    "reasonZh",
+  ]);
   if (!record) return null;
   const skillId = ownValue(record, "skillId");
   const name = ownValue(record, "name");
@@ -162,24 +271,63 @@ function cloneRecommendation(value: unknown): Recommendation | null {
 }
 
 function cloneRecommendationResponse(value: unknown): TaskRecommendationResponse | null {
-  const record = descriptors(value);
+  const safe = cloneUnproxiedJsonValue(value);
+  const record = safe === MISSING ? null : exactDataDescriptors(safe, [
+    "localMatchLevel",
+    "results",
+    "githubSearch",
+    "githubStatus",
+    "rawConsent",
+  ]);
   if (!record) return null;
+  const localMatchLevel = ownValue(record, "localMatchLevel");
   const resultValue = ownValue(record, "results");
   if (!Array.isArray(resultValue) || resultValue.length > 3) return null;
   const results = resultValue.map(cloneRecommendation);
   if (results.some((result) => result === null)) return null;
   const githubSearch = clonePreview(ownValue(record, "githubSearch"));
+  const githubStatusValue = ownValue(record, "githubStatus");
+  const githubStatus = githubStatusValue === null ? null : cloneGitHubStatus(githubStatusValue);
   const rawConsent = cloneConsent(ownValue(record, "rawConsent"));
-  if (githubSearch === MISSING || rawConsent === MISSING) return null;
+  if (
+    typeof localMatchLevel !== "string" ||
+    !["strong", "weak", "none"].includes(localMatchLevel) ||
+    (localMatchLevel === "none" && results.length !== 0) ||
+    (localMatchLevel !== "none" && results.length === 0) ||
+    githubSearch === MISSING ||
+    githubStatusValue === MISSING ||
+    (githubStatusValue !== null && githubStatus === null) ||
+    rawConsent === MISSING
+  ) return null;
+  const hasGitHubSearch = githubSearch !== null;
+  const hasRawConsent = rawConsent !== null;
+  if (
+    (localMatchLevel === "strong" && (hasGitHubSearch || hasRawConsent || githubStatus !== null)) ||
+    (localMatchLevel !== "strong" && githubStatus === null) ||
+    (localMatchLevel !== "strong" && githubStatus?.state === "ready" && hasGitHubSearch === hasRawConsent) ||
+    (localMatchLevel !== "strong" && githubStatus?.state !== "ready" && hasRawConsent)
+  ) return null;
   return {
+    localMatchLevel: localMatchLevel as TaskRecommendationResponse["localMatchLevel"],
     results: results as Recommendation[],
     githubSearch,
+    githubStatus,
     rawConsent,
   };
 }
 
 function cloneSuggestion(value: unknown): GitHubSkillSuggestion | null {
-  const record = descriptors(value);
+  const record = exactDataDescriptors(value, [
+    "repository",
+    "repositoryUrl",
+    "skillDirectory",
+    "name",
+    "summary",
+    "reasonZh",
+    "stars",
+    "pushedAt",
+    "license",
+  ]);
   if (!record) return null;
   const repository = ownValue(record, "repository");
   const repositoryUrl = ownValue(record, "repositoryUrl");
@@ -204,7 +352,7 @@ function cloneSuggestion(value: unknown): GitHubSkillSuggestion | null {
     typeof stars !== "number" ||
     !Number.isFinite(stars) ||
     stars < 0 ||
-    typeof pushedAt !== "string" ||
+    !isCanonicalIsoTimestamp(pushedAt) ||
     (license !== null && typeof license !== "string")
   ) {
     return null;
@@ -222,25 +370,119 @@ function cloneSuggestion(value: unknown): GitHubSkillSuggestion | null {
   };
 }
 
-function cloneRateLimit(value: unknown): GitHubSuggestionResponse["rateLimit"] | typeof MISSING {
+function cloneRateLimit(value: unknown): GitHubRateLimit | null | typeof MISSING {
   if (value === null) return null;
-  const record = descriptors(value);
+  const record = exactDataDescriptors(value, ["remaining", "reset", "retryAt"]);
   if (!record) return MISSING;
   const remaining = ownValue(record, "remaining");
   const reset = ownValue(record, "reset");
   const retryAt = ownValue(record, "retryAt");
   if (
-    (remaining !== null && (typeof remaining !== "number" || !Number.isFinite(remaining))) ||
-    (reset !== null && (typeof reset !== "number" || !Number.isFinite(reset))) ||
-    (retryAt !== null && (typeof retryAt !== "string" || !Number.isFinite(Date.parse(retryAt))))
+    (remaining !== null && (!Number.isSafeInteger(remaining) || remaining < 0)) ||
+    (reset !== null && (!Number.isSafeInteger(reset) || reset < 0)) ||
+    (retryAt !== null && !isCanonicalIsoTimestamp(retryAt))
   ) {
     return MISSING;
   }
   return { remaining, reset, retryAt };
 }
 
+function cloneRejectionCounts(value: unknown) {
+  if (!Array.isArray(value) || value.length > GITHUB_REJECTION_REASONS.length) return null;
+  const output: GitHubSearchDiagnostics["rejectionCounts"] = [];
+  let previousIndex = -1;
+  for (const item of value) {
+    const record = exactDataDescriptors(item, ["reason", "count"]);
+    if (!record) return null;
+    const reason = ownValue(record, "reason");
+    const count = ownValue(record, "count");
+    const reasonIndex = GITHUB_REJECTION_REASONS.indexOf(reason as GitHubRejectionReason);
+    if (
+      reasonIndex <= previousIndex ||
+      !Number.isSafeInteger(count) ||
+      (count as number) < 1
+    ) return null;
+    previousIndex = reasonIndex;
+    output.push({ reason: reason as GitHubRejectionReason, count: count as number });
+  }
+  return output;
+}
+
+function cloneGitHubDiagnostics(
+  value: unknown,
+  expected: { cached: boolean; incomplete: boolean },
+): GitHubSearchDiagnostics | null {
+  const record = exactDataDescriptors(value, [
+    "stageReached",
+    "repositoryHits",
+    "codeHits",
+    "validatedCandidates",
+    "rejectedCandidates",
+    "deduplicatedCandidates",
+    "rejectionCounts",
+    "cached",
+    "incomplete",
+    "rateLimits",
+  ]);
+  if (!record) return null;
+  const stageReached = ownValue(record, "stageReached");
+  const repositoryHits = ownValue(record, "repositoryHits");
+  const codeHits = ownValue(record, "codeHits");
+  const validatedCandidates = ownValue(record, "validatedCandidates");
+  const rejectedCandidates = ownValue(record, "rejectedCandidates");
+  const deduplicatedCandidates = ownValue(record, "deduplicatedCandidates");
+  const cached = ownValue(record, "cached");
+  const incomplete = ownValue(record, "incomplete");
+  const counters = [
+    repositoryHits,
+    codeHits,
+    validatedCandidates,
+    rejectedCandidates,
+    deduplicatedCandidates,
+  ];
+  const rejectionCounts = cloneRejectionCounts(ownValue(record, "rejectionCounts"));
+  const rateLimits = cloneGitHubRateLimits(ownValue(record, "rateLimits"));
+  if (
+    typeof stageReached !== "string" ||
+    !GITHUB_SEARCH_STAGES.has(stageReached as GitHubSearchStage) ||
+    counters.some((count) => !Number.isSafeInteger(count) || (count as number) < 0) ||
+    typeof cached !== "boolean" ||
+    typeof incomplete !== "boolean" ||
+    cached !== expected.cached ||
+    incomplete !== expected.incomplete ||
+    (!incomplete && stageReached !== "complete") ||
+    (incomplete && stageReached === "complete") ||
+    !rejectionCounts ||
+    rateLimits === MISSING ||
+    rejectionCounts.reduce((sum, item) => sum + item.count, 0) !== rejectedCandidates ||
+    (rejectionCounts.find((item) => item.reason === "duplicate")?.count ?? 0) !==
+      deduplicatedCandidates
+  ) return null;
+  return {
+    stageReached: stageReached as GitHubSearchStage,
+    repositoryHits: repositoryHits as number,
+    codeHits: codeHits as number,
+    validatedCandidates: validatedCandidates as number,
+    rejectedCandidates: rejectedCandidates as number,
+    deduplicatedCandidates: deduplicatedCandidates as number,
+    rejectionCounts,
+    cached,
+    incomplete,
+    rateLimits,
+  };
+}
+
 function cloneSuggestionResponse(value: unknown): GitHubSuggestionResponse | null {
-  const record = descriptors(value);
+  const safe = cloneUnproxiedJsonValue(value);
+  const record = safe === MISSING ? null : exactDataDescriptors(safe, [
+    "preview",
+    "results",
+    "cached",
+    "incomplete",
+    "rawConsent",
+    "rateLimit",
+    "diagnostics",
+  ]);
   if (!record) return null;
   const resultValue = ownValue(record, "results");
   const cached = ownValue(record, "cached");
@@ -258,7 +500,13 @@ function cloneSuggestionResponse(value: unknown): GitHubSuggestionResponse | nul
   const preview = clonePreview(ownValue(record, "preview"));
   const rawConsent = cloneConsent(ownValue(record, "rawConsent"));
   const rateLimit = cloneRateLimit(ownValue(record, "rateLimit"));
-  if (preview === MISSING || rawConsent === MISSING || rateLimit === MISSING) return null;
+  const diagnostics = cloneGitHubDiagnostics(ownValue(record, "diagnostics"), { cached, incomplete });
+  if (
+    preview === MISSING ||
+    rawConsent === MISSING ||
+    rateLimit === MISSING ||
+    !diagnostics
+  ) return null;
   return {
     preview,
     results: results as GitHubSkillSuggestion[],
@@ -266,6 +514,7 @@ function cloneSuggestionResponse(value: unknown): GitHubSuggestionResponse | nul
     incomplete,
     rawConsent,
     rateLimit,
+    diagnostics,
   };
 }
 
@@ -278,10 +527,22 @@ function safeJsonClone(value: unknown, depth = 0): unknown | typeof MISSING {
   ) return value;
   if (!value || typeof value !== "object" || depth >= 16) return MISSING;
   if (Array.isArray(value)) {
-    if (value.length > 4096) return MISSING;
+    if (Object.getPrototypeOf(value) !== Array.prototype) return MISSING;
+    const record = Object.getOwnPropertyDescriptors(value);
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+    const length = lengthDescriptor && Object.hasOwn(lengthDescriptor, "value")
+      ? lengthDescriptor.value
+      : MISSING;
+    if (!Number.isSafeInteger(length) || length < 0 || length > 4096) return MISSING;
+    const allowedKeys = new Set(["length", ...Array.from({ length }, (_, index) => String(index))]);
+    if (Reflect.ownKeys(record).some((key) => typeof key !== "string" || !allowedKeys.has(key))) {
+      return MISSING;
+    }
     const output = [];
-    for (const item of value) {
-      const cloned = safeJsonClone(item, depth + 1);
+    for (let index = 0; index < length; index += 1) {
+      const descriptor = record[String(index)];
+      if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, "value")) return MISSING;
+      const cloned = safeJsonClone(descriptor.value, depth + 1);
       if (cloned === MISSING) return MISSING;
       output.push(cloned);
     }
@@ -299,6 +560,17 @@ function safeJsonClone(value: unknown, depth = 0): unknown | typeof MISSING {
     output[key] = cloned;
   }
   return output;
+}
+
+function cloneUnproxiedJsonValue(value: unknown): unknown | typeof MISSING {
+  const cloned = safeJsonClone(value);
+  if (cloned === MISSING) return MISSING;
+  try {
+    structuredClone(value);
+  } catch {
+    return MISSING;
+  }
+  return cloned;
 }
 
 function cloneCatalog(value: unknown): Catalog | null {
@@ -350,7 +622,9 @@ async function parseSuccessfulResponse<T>(
   } catch (error) {
     if (isAbortError(error)) throw error;
     const safe = readBrowserApiError(error);
-    throw safe ? browserApiError(safe.code, safe.retryAt) : browserApiError(errorCode);
+    throw safe
+      ? browserApiError(safe.code, safe.retryAt, safe.stage)
+      : browserApiError(errorCode);
   }
 }
 
@@ -389,6 +663,16 @@ export async function recommendTask(
   return parseSuccessfulResponse(response, cloneRecommendationResponse, "local-response-invalid");
 }
 
+export async function getGitHubStatus(signal?: AbortSignal): Promise<GitHubServiceStatus> {
+  const response = await fetchResponse(`${API_BASE}/api/github-status`, {
+    method: "GET",
+    cache: "no-store",
+    signal,
+  }, "local-service-unavailable");
+  if (!response.ok) throw localHttpError(response);
+  return parseSuccessfulResponse(response, cloneGitHubStatus, "local-response-invalid");
+}
+
 async function readSafeErrorBody(response: Response) {
   let value: unknown;
   try {
@@ -402,9 +686,13 @@ async function readSafeErrorBody(response: Response) {
     if (!record) return null;
     const error = ownValue(record, "error");
     const retryAt = ownValue(record, "retryAt");
+    const stage = ownValue(record, "stage");
     return {
       error: typeof error === "string" ? error : null,
-      retryAt: typeof retryAt === "string" && Number.isFinite(Date.parse(retryAt)) ? retryAt : null,
+      retryAt: isCanonicalIsoTimestamp(retryAt) ? retryAt : null,
+      stage: typeof stage === "string" && GITHUB_SEARCH_STAGES.has(stage as GitHubSearchStage)
+        ? stage as GitHubSearchStage
+        : null,
     };
   } catch {
     return null;
@@ -413,27 +701,47 @@ async function readSafeErrorBody(response: Response) {
 
 async function githubHttpError(response: Response) {
   const body = await readSafeErrorBody(response);
-  if (response.status === 429) return browserApiError("github-rate-limited", body?.retryAt ?? null);
-  if (response.status === 422) return browserApiError("github-query-rejected");
-  if (response.status === 504) return browserApiError("github-request-timeout");
+  const stage = body?.stage ?? null;
+  if (response.status === 429) {
+    return browserApiError("github-rate-limited", body?.retryAt ?? null, stage);
+  }
+  if (response.status === 401 && body?.error === "github-token-invalid") {
+    return browserApiError("github-token-invalid", null, stage);
+  }
+  if (response.status === 422) return browserApiError("github-query-rejected", null, stage);
+  if (response.status === 504) return browserApiError("github-request-timeout", null, stage);
   if (response.status === 409) {
-    if (body?.error === "sanitized-query-unavailable") return browserApiError("sanitized-query-unavailable");
-    if (body?.error === "local-match-available") return browserApiError("local-match-available");
-    return browserApiError("github-request-failed");
+    if (body?.error === "sanitized-query-unavailable") {
+      return browserApiError("sanitized-query-unavailable", null, stage);
+    }
+    if (body?.error === "local-match-available") {
+      return browserApiError("local-match-available", null, stage);
+    }
+    return browserApiError("github-request-failed", null, stage);
   }
   if (response.status === 403) {
-    return body?.error === "raw-consent-required"
-      ? browserApiError("raw-consent-required")
-      : browserApiError("local-origin-forbidden");
+    if (body?.error === "raw-consent-required") {
+      return browserApiError("raw-consent-required", null, stage);
+    }
+    if (body?.error === "github-access-denied") {
+      return browserApiError("github-access-denied", null, stage);
+    }
+    return browserApiError("local-origin-forbidden", null, stage);
   }
   if (response.status === 502) {
-    return body?.error === "github-network-failed"
-      ? browserApiError("github-network-failed")
-      : browserApiError("github-request-failed");
+    return ["github-network-failed", "github-unavailable"].includes(body?.error ?? "")
+      ? browserApiError("github-network-failed", null, stage)
+      : browserApiError("github-request-failed", null, stage);
   }
-  if (response.status === 503) return browserApiError("github-suggestions-unavailable");
-  if (response.status === 400 || response.status === 413) return browserApiError("github-request-invalid");
-  return browserApiError("github-request-failed");
+  if (response.status === 503) {
+    return body?.error === "github-token-missing"
+      ? browserApiError("github-token-missing", null, stage)
+      : browserApiError("github-suggestions-unavailable", null, stage);
+  }
+  if (response.status === 400 || response.status === 413) {
+    return browserApiError("github-request-invalid", null, stage);
+  }
+  return browserApiError("github-request-failed", null, stage);
 }
 
 async function requestGitHubSuggestions(

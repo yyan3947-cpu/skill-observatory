@@ -15,6 +15,65 @@ const MAX_SAFE_JSON_ARRAY_ITEMS = 256;
 const MAX_SAFE_JSON_OBJECT_PROPERTIES = 128;
 const LOCAL_TRANSPORT_ERROR = Symbol("local-transport-error");
 const MISSING_BODY_FIELD = Symbol("missing-body-field");
+const LOCAL_RECOMMENDATION_FIELDS = [
+  "skillId",
+  "name",
+  "summaryZh",
+  "status",
+  "score",
+  "reasonCodes",
+  "reasonZh",
+];
+const GITHUB_SUGGESTION_FIELDS = [
+  "repository",
+  "repositoryUrl",
+  "skillDirectory",
+  "name",
+  "summary",
+  "reasonZh",
+  "stars",
+  "pushedAt",
+  "license",
+];
+const GITHUB_SUGGESTION_RESPONSE_FIELDS = [
+  "preview",
+  "results",
+  "cached",
+  "incomplete",
+  "rateLimit",
+  "diagnostics",
+];
+const GITHUB_RATE_LIMIT_FIELDS = ["remaining", "reset", "retryAt"];
+const GITHUB_STATUS_FIELDS = ["state", "checkedAt", "rateLimits"];
+const GITHUB_RATE_LIMIT_BUCKET_FIELDS = ["search", "codeSearch"];
+const GITHUB_DIAGNOSTIC_FIELDS = [
+  "stageReached",
+  "repositoryHits",
+  "codeHits",
+  "validatedCandidates",
+  "rejectedCandidates",
+  "deduplicatedCandidates",
+  "rejectionCounts",
+  "cached",
+  "incomplete",
+  "rateLimits",
+];
+const GITHUB_STATES = [
+  "ready",
+  "missing-token",
+  "invalid-token",
+  "rate-limited",
+  "github-unavailable",
+];
+const GITHUB_STAGES = ["repository-search", "code-search", "candidate-validation", "complete"];
+const GITHUB_REJECTION_REASONS = [
+  "invalid-structure",
+  "invalid-content",
+  "irrelevant",
+  "duplicate",
+  "unavailable",
+];
+const GITHUB_REPOSITORY_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u;
 
 function localApiError(code, status, transport = false) {
   const error = new Error(code);
@@ -158,6 +217,78 @@ function trackClientConnection(request, response) {
   };
 }
 
+function revokeConsentSafely(revoke, token) {
+  try {
+    return revoke(token) === true;
+  } catch {
+    return false;
+  }
+}
+
+function yieldToConnectionEvents() {
+  return new Promise((resolve) => {
+    // Resolve at the following check phase so Node must cross an I/O poll phase;
+    // one immediate can resume in the same turn before a peer close is observed.
+    setImmediate(() => setImmediate(resolve));
+  });
+}
+
+async function sendJsonWithRevocableConsent({
+  response,
+  status,
+  value,
+  origin,
+  connection,
+  consent,
+  revoke,
+}) {
+  if (consent) await yieldToConnectionEvents();
+  if (!connection.canRespond()) {
+    if (consent) revokeConsentSafely(revoke, consent.token);
+    return false;
+  }
+  if (!consent) {
+    sendJson(response, status, value, origin);
+    return true;
+  }
+
+  let finished = false;
+  let settled = false;
+  const cleanup = () => {
+    response.off("finish", onFinish);
+    response.off("close", onClose);
+  };
+  const revokeOnce = () => {
+    if (settled) return;
+    settled = true;
+    revokeConsentSafely(revoke, consent.token);
+  };
+  const onFinish = () => {
+    finished = true;
+    settled = true;
+    cleanup();
+  };
+  const onClose = () => {
+    if (!finished) revokeOnce();
+    cleanup();
+  };
+  response.once("finish", onFinish);
+  response.once("close", onClose);
+  if (!connection.canRespond()) {
+    cleanup();
+    revokeOnce();
+    return false;
+  }
+  try {
+    sendJson(response, status, value, origin);
+    return true;
+  } catch (error) {
+    cleanup();
+    revokeOnce();
+    throw error;
+  }
+}
+
 function safeRetryAt(value) {
   if (typeof value !== "string") return null;
   const milliseconds = Date.parse(value);
@@ -182,25 +313,40 @@ function ownDataProperty(value, key) {
 
 function safeGitHubError(error) {
   const code = ownDataProperty(error, "code");
+  const stageValue = ownDataProperty(error, "stage");
+  const stage = GITHUB_STAGES.includes(stageValue) ? stageValue : null;
+  const withStage = (body) => stage === null ? body : { ...body, stage };
   if (code === "github-rate-limited") {
     return {
       status: 429,
-      body: {
+      body: withStage({
         error: "github-rate-limited",
         retryAt: safeRetryAt(ownDataProperty(error, "retryAt")),
-      },
+      }),
     };
   }
+  if (code === "github-token-missing") {
+    return { status: 503, body: withStage({ error: "github-token-missing" }) };
+  }
+  if (code === "github-token-invalid") {
+    return { status: 401, body: withStage({ error: "github-token-invalid" }) };
+  }
+  if (code === "github-access-denied") {
+    return { status: 403, body: withStage({ error: "github-access-denied" }) };
+  }
+  if (code === "github-unavailable") {
+    return { status: 502, body: withStage({ error: "github-unavailable" }) };
+  }
   if (code === "github-query-rejected") {
-    return { status: 422, body: { error: "github-query-rejected" } };
+    return { status: 422, body: withStage({ error: "github-query-rejected" }) };
   }
   if (code === "github-request-timeout") {
-    return { status: 504, body: { error: "github-request-timeout" } };
+    return { status: 504, body: withStage({ error: "github-request-timeout" }) };
   }
   if (code === "github-network-failed") {
-    return { status: 502, body: { error: "github-network-failed" } };
+    return { status: 502, body: withStage({ error: "github-network-failed" }) };
   }
-  return { status: 502, body: { error: "github-request-failed" } };
+  return { status: 502, body: withStage({ error: "github-request-failed" }) };
 }
 
 function safeGitHubLogError(code) {
@@ -213,6 +359,14 @@ function safeGitHubLogError(code) {
     writable: true,
   });
   return error;
+}
+
+async function resolveSafeRecommendDependency(resolve) {
+  try {
+    return await resolve();
+  } catch {
+    throw safeGitHubLogError("github-request-failed");
+  }
 }
 
 function reportError(onError, error) {
@@ -298,24 +452,304 @@ function cloneSafeJsonValue(value, seen = new WeakSet(), depth = 0) {
   }
 }
 
-function normalizeGitHubSuggestions(value, preview) {
+function hasExactOwnDataFields(value, fields) {
+  if (!isPlainObject(value)) return false;
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const keys = Reflect.ownKeys(descriptors);
+  if (
+    keys.length !== fields.length ||
+    keys.some((key) => typeof key !== "string" || !fields.includes(key))
+  ) return false;
+  return fields.every((field) => {
+    const descriptor = descriptors[field];
+    return descriptor.enumerable && Object.hasOwn(descriptor, "value");
+  });
+}
+
+function normalizeLocalRecommendations(value) {
   const safe = cloneSafeJsonValue(value);
   if (
-    !isPlainObject(safe) ||
+    !hasExactOwnDataFields(safe, ["level", "results"]) ||
+    !["strong", "weak", "none"].includes(safe.level) ||
     !Array.isArray(safe.results) ||
     safe.results.length > 3 ||
-    typeof safe.cached !== "boolean" ||
-    typeof safe.incomplete !== "boolean" ||
-    (safe.rateLimit !== null && !isPlainObject(safe.rateLimit))
+    (safe.level === "none" && safe.results.length !== 0) ||
+    (safe.level !== "none" && safe.results.length === 0)
+  ) {
+    throw localApiError("local-recommendation-failed");
+  }
+  const results = safe.results.map((item) => {
+    if (
+      !hasExactOwnDataFields(item, LOCAL_RECOMMENDATION_FIELDS) ||
+      typeof item.skillId !== "string" ||
+      typeof item.name !== "string" ||
+      typeof item.summaryZh !== "string" ||
+      !["ready", "needs-config", "abnormal", "unchecked"].includes(item.status) ||
+      typeof item.score !== "number" ||
+      !Number.isFinite(item.score) ||
+      !Array.isArray(item.reasonCodes) ||
+      item.reasonCodes.length > MAX_SAFE_JSON_ARRAY_ITEMS ||
+      !item.reasonCodes.every((code) => typeof code === "string") ||
+      typeof item.reasonZh !== "string"
+    ) {
+      throw localApiError("local-recommendation-failed");
+    }
+    return {
+      skillId: item.skillId,
+      name: item.name,
+      summaryZh: item.summaryZh,
+      status: item.status,
+      score: item.score,
+      reasonCodes: item.reasonCodes,
+      reasonZh: item.reasonZh,
+    };
+  });
+  return { level: safe.level, results };
+}
+
+function normalizePublicGitHubPreview(value) {
+  if (value === null) return null;
+  const safe = cloneSafeJsonValue(value);
+  if (!isPlainObject(safe)) {
+    throw localApiError("github-request-failed");
+  }
+  const fields = Reflect.ownKeys(safe);
+  if (
+    ![2, 3].includes(fields.length) ||
+    fields.some((field) => (
+      typeof field !== "string" || !["terms", "label", "cacheKey"].includes(field)
+    )) ||
+    !Object.hasOwn(safe, "terms") ||
+    !Object.hasOwn(safe, "label") ||
+    !Array.isArray(safe.terms) ||
+    safe.terms.length > 6 ||
+    !safe.terms.every((term) => typeof term === "string") ||
+    typeof safe.label !== "string" ||
+    (Object.hasOwn(safe, "cacheKey") && (
+      typeof safe.cacheKey !== "string" || !safe.cacheKey || safe.cacheKey.length > 128
+    ))
+  ) {
+    throw localApiError("github-request-failed");
+  }
+  return { terms: safe.terms, label: safe.label };
+}
+
+function isCanonicalIsoTimestamp(value) {
+  if (typeof value !== "string") return false;
+  const milliseconds = Date.parse(value);
+  if (!Number.isFinite(milliseconds)) return false;
+  return new Date(milliseconds).toISOString() === value;
+}
+
+function normalizeGitHubRateLimit(value) {
+  if (value === null) return null;
+  if (!hasExactOwnDataFields(value, GITHUB_RATE_LIMIT_FIELDS)) {
+    throw localApiError("github-request-failed");
+  }
+  const { remaining, reset, retryAt } = value;
+  if (
+    !(remaining === null || (Number.isSafeInteger(remaining) && remaining >= 0)) ||
+    !(reset === null || (Number.isSafeInteger(reset) && reset >= 0)) ||
+    !(retryAt === null || isCanonicalIsoTimestamp(retryAt))
+  ) {
+    throw localApiError("github-request-failed");
+  }
+  return { remaining, reset, retryAt };
+}
+
+function normalizeGitHubRateLimits(value) {
+  if (!hasExactOwnDataFields(value, GITHUB_RATE_LIMIT_BUCKET_FIELDS)) {
+    throw localApiError("github-request-failed");
+  }
+  return {
+    search: normalizeGitHubRateLimit(value.search),
+    codeSearch: normalizeGitHubRateLimit(value.codeSearch),
+  };
+}
+
+function normalizeGitHubStatus(value) {
+  const safe = cloneSafeJsonValue(value);
+  if (
+    !hasExactOwnDataFields(safe, GITHUB_STATUS_FIELDS) ||
+    !GITHUB_STATES.includes(safe.state) ||
+    !isCanonicalIsoTimestamp(safe.checkedAt)
+  ) {
+    throw localApiError("github-request-failed");
+  }
+  const rateLimits = normalizeGitHubRateLimits(safe.rateLimits);
+  if (
+    ["missing-token", "invalid-token", "github-unavailable"].includes(safe.state) &&
+    (rateLimits.search !== null || rateLimits.codeSearch !== null)
+  ) {
+    throw localApiError("github-request-failed");
+  }
+  if (safe.state === "ready" && rateLimits.search?.remaining === 0) {
+    throw localApiError("github-request-failed");
+  }
+  return { state: safe.state, checkedAt: safe.checkedAt, rateLimits };
+}
+
+function githubStatusError(status) {
+  const code = {
+    "missing-token": "github-token-missing",
+    "invalid-token": "github-token-invalid",
+    "rate-limited": "github-rate-limited",
+    "github-unavailable": "github-unavailable",
+  }[status.state];
+  if (!code) return null;
+  const error = new Error(code);
+  Object.defineProperties(error, {
+    code: { value: code, enumerable: true },
+    stage: { value: "repository-search", enumerable: true },
+    retryAt: {
+      value: status.state === "rate-limited" ? status.rateLimits.search?.retryAt ?? null : null,
+      enumerable: true,
+    },
+  });
+  return error;
+}
+
+function normalizeRejectionCounts(value) {
+  if (!Array.isArray(value) || value.length > GITHUB_REJECTION_REASONS.length) {
+    throw localApiError("github-request-failed");
+  }
+  const output = [];
+  let previousIndex = -1;
+  for (const item of value) {
+    if (!hasExactOwnDataFields(item, ["reason", "count"])) {
+      throw localApiError("github-request-failed");
+    }
+    const reasonIndex = GITHUB_REJECTION_REASONS.indexOf(item.reason);
+    if (
+      reasonIndex <= previousIndex ||
+      !Number.isSafeInteger(item.count) ||
+      item.count < 1
+    ) {
+      throw localApiError("github-request-failed");
+    }
+    previousIndex = reasonIndex;
+    output.push({ reason: item.reason, count: item.count });
+  }
+  return output;
+}
+
+function normalizeGitHubDiagnostics(value, { cached, incomplete }) {
+  if (!hasExactOwnDataFields(value, GITHUB_DIAGNOSTIC_FIELDS)) {
+    throw localApiError("github-request-failed");
+  }
+  const counters = [
+    value.repositoryHits,
+    value.codeHits,
+    value.validatedCandidates,
+    value.rejectedCandidates,
+    value.deduplicatedCandidates,
+  ];
+  if (
+    !GITHUB_STAGES.includes(value.stageReached) ||
+    counters.some((count) => !Number.isSafeInteger(count) || count < 0) ||
+    typeof value.cached !== "boolean" ||
+    typeof value.incomplete !== "boolean" ||
+    value.cached !== cached ||
+    value.incomplete !== incomplete ||
+    (!value.incomplete && value.stageReached !== "complete") ||
+    (value.incomplete && value.stageReached === "complete")
+  ) {
+    throw localApiError("github-request-failed");
+  }
+  const rejectionCounts = normalizeRejectionCounts(value.rejectionCounts);
+  if (
+    rejectionCounts.reduce((sum, item) => sum + item.count, 0) !== value.rejectedCandidates ||
+    (rejectionCounts.find((item) => item.reason === "duplicate")?.count ?? 0) !==
+      value.deduplicatedCandidates
   ) {
     throw localApiError("github-request-failed");
   }
   return {
-    preview: cloneSafeJsonValue(preview),
-    results: safe.results,
+    stageReached: value.stageReached,
+    repositoryHits: value.repositoryHits,
+    codeHits: value.codeHits,
+    validatedCandidates: value.validatedCandidates,
+    rejectedCandidates: value.rejectedCandidates,
+    deduplicatedCandidates: value.deduplicatedCandidates,
+    rejectionCounts,
+    cached: value.cached,
+    incomplete: value.incomplete,
+    rateLimits: normalizeGitHubRateLimits(value.rateLimits),
+  };
+}
+
+function normalizeGitHubSuggestions(value, preview) {
+  const safe = cloneSafeJsonValue(value);
+  if (
+    !hasExactOwnDataFields(safe, GITHUB_SUGGESTION_RESPONSE_FIELDS) ||
+    !Array.isArray(safe.results) ||
+    safe.results.length > 3 ||
+    typeof safe.cached !== "boolean" ||
+    typeof safe.incomplete !== "boolean"
+  ) {
+    throw localApiError("github-request-failed");
+  }
+  const expectedPreview = normalizePublicGitHubPreview(preview);
+  const responsePreview = normalizePublicGitHubPreview(safe.preview);
+  if (
+    (expectedPreview === null) !== (responsePreview === null) ||
+    (expectedPreview && responsePreview && (
+      expectedPreview.label !== responsePreview.label ||
+      expectedPreview.terms.length !== responsePreview.terms.length ||
+      expectedPreview.terms.some((term, index) => term !== responsePreview.terms[index])
+    ))
+  ) {
+    throw localApiError("github-request-failed");
+  }
+  const results = safe.results.map((item) => {
+    if (!hasExactOwnDataFields(item, GITHUB_SUGGESTION_FIELDS)) {
+      throw localApiError("github-request-failed");
+    }
+    const repositorySegments = typeof item.repository === "string"
+      ? item.repository.split("/")
+      : [];
+    if (
+      typeof item.repository !== "string" ||
+      !GITHUB_REPOSITORY_PATTERN.test(item.repository) ||
+      repositorySegments.some((segment) => segment === "." || segment === "..") ||
+      typeof item.repositoryUrl !== "string" ||
+      item.repositoryUrl !== `https://github.com/${item.repository}` ||
+      typeof item.skillDirectory !== "string" ||
+      typeof item.name !== "string" ||
+      typeof item.summary !== "string" ||
+      typeof item.reasonZh !== "string" ||
+      typeof item.stars !== "number" ||
+      !Number.isFinite(item.stars) ||
+      item.stars < 0 ||
+      typeof item.pushedAt !== "string" ||
+      (item.license !== null && typeof item.license !== "string")
+    ) {
+      throw localApiError("github-request-failed");
+    }
+    return {
+      repository: item.repository,
+      repositoryUrl: item.repositoryUrl,
+      skillDirectory: item.skillDirectory,
+      name: item.name,
+      summary: item.summary,
+      reasonZh: item.reasonZh,
+      stars: item.stars,
+      pushedAt: item.pushedAt,
+      license: item.license,
+    };
+  });
+  const rateLimit = normalizeGitHubRateLimit(safe.rateLimit);
+  const diagnostics = normalizeGitHubDiagnostics(safe.diagnostics, {
     cached: safe.cached,
     incomplete: safe.incomplete,
-    rateLimit: safe.rateLimit,
+  });
+  return {
+    preview: expectedPreview,
+    results,
+    cached: safe.cached,
+    incomplete: safe.incomplete,
+    rateLimit,
+    diagnostics,
   };
 }
 
@@ -371,6 +805,7 @@ export function createLocalApi({
   syncCatalog,
   getCatalog,
   recommend,
+  getGitHubStatus,
   previewGitHubSearch,
   findGitHubSuggestions,
   findOriginalGitHubSuggestions,
@@ -379,6 +814,13 @@ export function createLocalApi({
 }) {
   if (host !== DEFAULT_API_HOST) throw new Error("loopback-host-required");
   const previewSearch = typeof previewGitHubSearch === "function" ? previewGitHubSearch : () => null;
+  const statusGetter = typeof getGitHubStatus === "function"
+    ? getGitHubStatus
+    : async () => ({
+      state: "missing-token",
+      checkedAt: new Date().toISOString(),
+      rateLimits: { search: null, codeSearch: null },
+    });
   const suggestionFinder = typeof findGitHubSuggestions === "function" ? findGitHubSuggestions : null;
   const originalSuggestionFinder = typeof findOriginalGitHubSuggestions === "function"
     ? findOriginalGitHubSuggestions
@@ -410,6 +852,14 @@ export function createLocalApi({
 
     const url = new URL(request.url ?? "/", `http://${host}:${port}`);
     try {
+      if (url.pathname === "/api/github-status") {
+        if (request.method !== "GET") {
+          sendJson(response, 405, { error: "method-not-allowed" }, origin);
+          return;
+        }
+        sendJson(response, 200, normalizeGitHubStatus(await statusGetter()), origin);
+        return;
+      }
       if (url.pathname === "/api/catalog") {
         if (request.method !== "GET") {
           sendJson(response, 405, { error: "method-not-allowed" }, origin);
@@ -435,23 +885,42 @@ export function createLocalApi({
         const connection = trackClientConnection(request, response);
         try {
           const body = await readJsonBody(request);
-          const fields = snapshotRequestBody(body, ["query"]);
+          const fields = snapshotRequestBody(body, ["query"], { exact: true });
           if (!fields || !isValidQuery(fields.query)) {
             sendJson(response, 400, { error: "invalid-query" }, origin);
             return;
           }
           const canonicalQuery = fields.query.trim();
-          const results = recommend(canonicalQuery, await getCatalog());
-          const githubSearch = results.length ? null : previewSearch(canonicalQuery);
+          const local = normalizeLocalRecommendations(recommend(canonicalQuery, await getCatalog()));
+          const githubStatus = local.level === "strong"
+            ? null
+            : await resolveSafeRecommendDependency(async () => (
+              normalizeGitHubStatus(await statusGetter())
+            ));
+          const githubSearch = local.level === "strong"
+            ? null
+            : await resolveSafeRecommendDependency(() => (
+              normalizePublicGitHubPreview(previewSearch(canonicalQuery))
+            ));
           if (!connection.canRespond()) return;
-          const rawConsent = !results.length && !githubSearch
+          const rawConsent = githubStatus?.state === "ready" && !githubSearch
             ? consentStore.issue(canonicalQuery)
             : null;
-          if (!connection.canRespond()) {
-            if (rawConsent) consentStore.revoke(rawConsent.token);
-            return;
-          }
-          sendJson(response, 200, { results, githubSearch, rawConsent }, origin);
+          await sendJsonWithRevocableConsent({
+            response,
+            status: 200,
+            value: {
+              localMatchLevel: local.level,
+              results: local.results,
+              githubSearch,
+              githubStatus,
+              rawConsent,
+            },
+            origin,
+            connection,
+            consent: rawConsent,
+            revoke: consentStore.revoke,
+          });
           return;
         } finally {
           connection.dispose();
@@ -465,22 +934,26 @@ export function createLocalApi({
         const connection = trackClientConnection(request, response);
         try {
           const body = await readJsonBody(request);
-          const fields = snapshotRequestBody(body, ["query"]);
+          const fields = snapshotRequestBody(body, ["query"], { exact: true });
           if (!fields || !isValidQuery(fields.query)) {
             sendJson(response, 400, { error: "invalid-query" }, origin);
             return;
           }
           const canonicalQuery = fields.query.trim();
-          const localResults = recommend(canonicalQuery, await getCatalog());
-          if (localResults.length) {
+          const local = normalizeLocalRecommendations(recommend(canonicalQuery, await getCatalog()));
+          if (local.level === "strong") {
             sendJson(response, 409, { error: "local-match-available" }, origin);
             return;
           }
-          const githubSearch = previewSearch(canonicalQuery);
-          if (!githubSearch) {
+          const internalGitHubSearch = previewSearch(canonicalQuery);
+          if (!internalGitHubSearch) {
             sendJson(response, 409, { error: "sanitized-query-unavailable" }, origin);
             return;
           }
+          const githubSearch = normalizePublicGitHubPreview(internalGitHubSearch);
+          const githubStatus = normalizeGitHubStatus(await statusGetter());
+          const statusError = githubStatusError(githubStatus);
+          if (statusError) throw statusError;
           if (!suggestionFinder) {
             sendJson(response, 503, { error: "github-suggestions-unavailable" }, origin);
             return;
@@ -493,11 +966,15 @@ export function createLocalApi({
           const rawConsent = suggestions.results.length === 0 && suggestions.incomplete === false
             ? consentStore.issue(canonicalQuery)
             : null;
-          if (!connection.canRespond()) {
-            if (rawConsent) consentStore.revoke(rawConsent.token);
-            return;
-          }
-          sendJson(response, 200, { ...suggestions, rawConsent }, origin);
+          await sendJsonWithRevocableConsent({
+            response,
+            status: 200,
+            value: { ...suggestions, rawConsent },
+            origin,
+            connection,
+            consent: rawConsent,
+            revoke: consentStore.revoke,
+          });
           return;
         } finally {
           connection.dispose();
@@ -524,8 +1001,15 @@ export function createLocalApi({
           return;
         }
         const body = await readJsonBody(request);
-        const fields = snapshotRequestBody(body, ["query", "consentToken"]);
-        if (!fields || !isValidQuery(fields.query)) {
+        const fields = snapshotRequestBody(body, ["query", "consentToken"], { exact: true });
+        if (!fields) {
+          const queryOnly = snapshotRequestBody(body, ["query"], { exact: true });
+          sendJson(response, 400, {
+            error: queryOnly && isValidQuery(queryOnly.query) ? "invalid-consent" : "invalid-query",
+          }, origin);
+          return;
+        }
+        if (!isValidQuery(fields.query)) {
           sendJson(response, 400, { error: "invalid-query" }, origin);
           return;
         }
@@ -534,11 +1018,14 @@ export function createLocalApi({
           return;
         }
         const canonicalQuery = fields.query.trim();
-        const localResults = recommend(canonicalQuery, await getCatalog());
-        if (localResults.length) {
+        const local = normalizeLocalRecommendations(recommend(canonicalQuery, await getCatalog()));
+        if (local.level === "strong") {
           sendJson(response, 409, { error: "local-match-available" }, origin);
           return;
         }
+        const githubStatus = normalizeGitHubStatus(await statusGetter());
+        const statusError = githubStatusError(githubStatus);
+        if (statusError) throw statusError;
         if (!originalSuggestionFinder) {
           sendJson(response, 503, { error: "github-suggestions-unavailable" }, origin);
           return;
@@ -569,6 +1056,7 @@ export function createLocalApi({
         return;
       }
       if ([
+        "/api/github-status",
         "/api/github-suggestions",
         "/api/github-suggestions/original",
         "/api/github-suggestions/revoke",

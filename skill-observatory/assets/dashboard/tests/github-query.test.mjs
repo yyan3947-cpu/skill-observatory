@@ -1,11 +1,15 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
 import { join } from "node:path";
 import test from "node:test";
-import { MAX_GITHUB_REPOSITORY_QUERY_CHARACTERS } from "../lib/github-query-contract.mjs";
+import {
+  assertGitHubCodeQueryWithinLimit,
+  MAX_GITHUB_CODE_QUERY_CHARACTERS,
+  MAX_GITHUB_REPOSITORY_QUERY_CHARACTERS,
+} from "../lib/github-query-contract.mjs";
 import {
   buildOriginalGitHubRepositoryQueries,
   buildGitHubRepositoryQueries,
+  buildGitHubSearchPlan,
   buildGitHubSearchPreview,
 } from "../lib/github-query.mjs";
 
@@ -15,13 +19,55 @@ test("reduces a task to capability terms and removes sensitive details", () => {
     `请读取 ${privatePath}，联系 alice@example.com，帮 Acme 20260815 搜寻国际时事`,
   );
 
-  assert.deepEqual(preview.terms, ["current affairs", "news", "research"]);
-  assert.equal(preview.label, "current affairs · news · research");
+  assert.deepEqual(preview, {
+    terms: ["current affairs", "news", "research"],
+    label: "current affairs · news · research",
+  });
   assert.doesNotMatch(JSON.stringify(preview), /alice|Acme|20260815|secret/);
-  assert.equal(
-    preview.cacheKey,
-    createHash("sha256").update("current affairs\0news\0research").digest("hex"),
+});
+
+test("builds one bounded Skill file query from controlled terms", () => {
+  const plan = buildGitHubSearchPlan("为 Acme 私有项目生成二维码");
+
+  assert.equal(plan.codeQuery, '"qr code" generator filename:SKILL.md');
+  assert.doesNotMatch(plan.codeQuery, /Acme|私有项目/u);
+  assert.deepEqual(buildGitHubSearchPreview("为 Acme 私有项目生成二维码"), {
+    terms: ["qr code", "generator", "skill"],
+    label: "qr code · generator · skill",
+  });
+});
+
+test("does not create code search without a safe preview", () => {
+  assert.equal(buildGitHubSearchPlan("星河项目内部并购计划"), null);
+});
+
+test("bounds code queries by Unicode code points without coercing objects", () => {
+  assert.equal(MAX_GITHUB_CODE_QUERY_CHARACTERS, 256);
+  const accepted = "😀".repeat(MAX_GITHUB_CODE_QUERY_CHARACTERS);
+  assert.equal(assertGitHubCodeQueryWithinLimit(accepted), accepted);
+  assert.throws(
+    () => assertGitHubCodeQueryWithinLimit(`${accepted}😀`),
+    (error) => error.code === "github-query-rejected" &&
+      error.status === 422 &&
+      !error.message.includes("😀"),
   );
+  assert.throws(
+    () => assertGitHubCodeQueryWithinLimit(""),
+    (error) => error.code === "github-query-rejected",
+  );
+
+  let trapCalls = 0;
+  const unsafe = new Proxy({}, {
+    get() {
+      trapCalls += 1;
+      return () => "hidden-query";
+    },
+  });
+  assert.throws(
+    () => assertGitHubCodeQueryWithinLimit(unsafe),
+    (error) => error.code === "github-query-rejected",
+  );
+  assert.equal(trapCalls, 0);
 });
 
 test("falls back to fixed action terms without sending arbitrary task subjects", () => {
@@ -58,6 +104,24 @@ test("maps data checking tasks to fixed validation terms", () => {
     JSON.stringify(buildGitHubSearchPreview("检测星河项目客户数据")),
     /星河|客户/u,
   );
+});
+
+test("builds at most three pre-approved sanitized repository queries", () => {
+  const plan = buildGitHubSearchPlan("检测 Acme 客户数据质量");
+  assert.deepEqual(plan.preview.terms, ["data validation", "testing", "skill"]);
+  assert.deepEqual(plan.semanticTerms, ["data validation", "testing", "data testing"]);
+  assert.equal(plan.semanticTerms.includes("skill"), false);
+  assert.equal(plan.repositoryQueries.length, 3);
+  assert.deepEqual(plan.repositoryQueries.map((item) => item.mode), ["best-match", "best-match", "stars"]);
+  assert.ok(plan.repositoryQueries.every((item) => item.q.includes('"SKILL.md"')));
+  assert.doesNotMatch(JSON.stringify(plan), /Acme|客户|质量/u);
+});
+
+test("uses one bounded plan for action-only fallbacks", () => {
+  const plan = buildGitHubSearchPlan("分析 星河项目");
+  assert.ok(plan.repositoryQueries.length >= 1 && plan.repositoryQueries.length <= 3);
+  assert.doesNotMatch(JSON.stringify(plan), /星河/u);
+  assert.ok(plan.repositoryQueries.every((item) => item.q.length <= 256));
 });
 
 test("returns null when neither a controlled capability nor action matches", () => {
